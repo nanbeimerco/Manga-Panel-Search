@@ -1,0 +1,485 @@
+<!DOCTYPE html>
+<html lang="ja" data-theme="titanium_slate">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Manga Panel Search | 漫画コマ特定アプリ (Material 3)</title>
+  
+  <!-- Material 3 & Fonts: Montserrat & Noto Sans JP -->
+  <link rel="stylesheet" href="/static/css/material3.css">
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220%22%20width=%22100%22%20height=%22100%22><text y=%22.9em%22 font-size=%2290%22>📖</text></svg>">
+</head>
+<body>
+
+  <!-- Custom Title Bar for Electron Frameless Window (Hidden in web browser) -->
+  <div id="electron-titlebar" class="electron-titlebar">
+    <div class="titlebar-drag-region">
+      <span class="material-symbols-outlined titlebar-icon">auto_stories</span>
+      <span class="titlebar-brand">Manga Panel Search</span>
+    </div>
+    <div class="titlebar-controls">
+      <button class="titlebar-btn btn-minimize" id="btn-minimize" title="最小化" aria-label="最小化">
+        <svg width="10" height="1" viewBox="0 0 10 1"><rect width="10" height="1" fill="currentColor"/></svg>
+      </button>
+      <button class="titlebar-btn btn-maximize" id="btn-maximize" title="最大化 / 元に戻す" aria-label="最大化 / 元に戻す">
+        <svg id="icon-maximize" width="10" height="10" viewBox="0 0 10 10"><rect x="0.5" y="0.5" width="9" height="9" fill="none" stroke="currentColor" stroke-width="1"/></svg>
+        <svg id="icon-restore" width="10" height="10" viewBox="0 0 10 10" style="display: none;"><rect x="2.5" y="0.5" width="7" height="7" fill="none" stroke="currentColor" stroke-width="1"/><path d="M0.5 2.5v7h7" fill="none" stroke="currentColor" stroke-width="1"/></svg>
+      </button>
+      <button class="titlebar-btn btn-close" id="btn-close" title="閉じる" aria-label="閉じる">
+        <svg width="10" height="10" viewBox="0 0 10 10"><path d="M0.5 0.5l9 9M9.5 0.5l-9 9" stroke="currentColor" stroke-width="1.2"/></svg>
+      </button>
+    </div>
+  </div>
+
+  <!-- Top App Bar (Material 3 Center-aligned / Small) -->
+  <header class="m3-top-app-bar">
+    <div class="m3-app-title">
+      <span class="material-symbols-outlined" style="color: var(--md-sys-color-primary); font-size: 28px;">auto_stories</span>
+      <span class="brand">MANGA PANEL SEARCH</span>
+    </div>
+
+    <div style="display: flex; align-items: center; gap: 16px;">
+      <!-- Quick Theme Preset Picker -->
+      <div class="m3-theme-selector">
+        <label for="header-theme-select">
+          <span class="material-symbols-outlined" style="font-size: 16px; color: var(--md-sys-color-primary);">palette</span>
+          THEME:
+        </label>
+        <select id="header-theme-select" class="m3-theme-select">
+          <option value="titanium_slate">Titanium Slate</option>
+          <option value="material_lavender">Material Lavender</option>
+          <option value="nordic_emerald">Nordic Emerald</option>
+          <option value="amber_bronze">Amber Bronze</option>
+          <option value="sakura_rose">Sakura Rose</option>
+        </select>
+      </div>
+
+      <!-- System Status Badge -->
+      <span class="m3-badge-status pending" id="global-status-badge">
+        <span class="material-symbols-outlined" style="font-size: 16px;">sync</span>
+        初期化中...
+      </span>
+    </div>
+  </header>
+
+  <!-- Material 3 Navigation Tabs -->
+  <nav class="m3-tabs">
+    <button class="m3-tab-btn active" data-target="tab-search">
+      <span class="material-symbols-outlined">crop</span>
+      コマ検索
+    </button>
+    <button class="m3-tab-btn" data-target="tab-library">
+      <span class="material-symbols-outlined">library_books</span>
+      登録ライブラリ
+    </button>
+    <button class="m3-tab-btn" data-target="tab-settings">
+      <span class="material-symbols-outlined">settings</span>
+      設定
+    </button>
+  </nav>
+
+  <!-- Main Container -->
+  <main class="m3-main-container">
+
+    <!-- TAB 1: Search Panel -->
+    <section id="tab-search" class="m3-page-view active">
+      
+      <!-- Search Scope Banner -->
+      <div id="search-scope-banner" class="m3-scope-banner" style="display: none;">
+        <div style="display: flex; align-items: center; gap: 12px;">
+          <span class="material-symbols-outlined" style="font-size: 26px;">filter_alt</span>
+          <div>
+            <div id="search-scope-title" style="font-size: 0.98rem; font-weight: 800;">検索対象: 全巻</div>
+            <div id="search-scope-sub" style="font-size: 0.82rem; opacity: 0.9; margin-top: 2px;">すべての作品から検索します</div>
+          </div>
+        </div>
+        <button class="m3-btn m3-btn-outlined" id="btn-goto-library" style="border-color: currentColor; color: inherit; padding: 6px 14px; font-size: 0.85rem;">
+          <span class="material-symbols-outlined" style="font-size: 18px;">library_books</span>
+          作品・巻の選択を変更
+        </button>
+      </div>
+
+      <!-- Upload Card -->
+      <div class="m3-card">
+        <div class="m3-card-header">
+          <h2 class="m3-card-title">
+            <span class="material-symbols-outlined" style="color: var(--md-sys-color-primary);">image_search</span>
+            探したいコマ画像をアップロード
+          </h2>
+          <span style="font-size: 0.85rem; font-weight: 700; color: var(--md-sys-color-secondary);">
+            対応形式: JPG, PNG, WEBP / クリップボード貼り付け (Ctrl+V) 対応
+          </span>
+        </div>
+
+        <div class="m3-dropzone" id="dropzone">
+          <span class="material-symbols-outlined icon">cloud_upload</span>
+          <p class="prompt">ここに1コマ画像をドラッグ＆ドロップ</p>
+          <p class="subtext">またはクリックして画像を選択、またはこの画面で Ctrl+V で貼り付け</p>
+          <input type="file" id="file-input" accept="image/png, image/jpeg, image/webp" style="display: none;">
+          <button class="m3-btn m3-btn-filled" id="btn-select-file" style="margin-top: 8px;">
+            <span class="material-symbols-outlined">folder_open</span>
+            ファイルを選択
+          </button>
+        </div>
+
+        <!-- Search Options (Photo / Yellow Paper Normalization Toggle) -->
+        <div style="display: flex; align-items: center; justify-content: space-between; margin-top: 14px; padding: 12px 16px; background: var(--md-sys-color-surface-container-high); border-radius: var(--md-sys-shape-corner-medium); border: 1px solid var(--md-sys-color-outline-variant);">
+          <div style="display: flex; align-items: center; gap: 10px;">
+            <span class="material-symbols-outlined" style="color: var(--md-sys-color-primary); font-size: 22px;">auto_fix_high</span>
+            <div>
+              <span style="font-weight: 800; font-size: 0.92rem; color: var(--md-sys-color-on-surface);">紙焼け・撮影影の自動補正</span>
+              <span style="font-size: 0.78rem; color: var(--md-sys-color-secondary); display: block; margin-top: 2px;">スマートフォンの撮影写真など、紙焼けや影がある場合に背景の明度を自動補正します（通常のスキャン画像は自動判別して画質を保持します）</span>
+            </div>
+          </div>
+          <label style="display: flex; align-items: center; gap: 8px; cursor: pointer; font-weight: 800; font-size: 0.88rem; color: var(--md-sys-color-primary);">
+            <input type="checkbox" id="check-normalize-photo" checked style="width: 18px; height: 18px; accent-color: var(--md-sys-color-primary); cursor: pointer;">
+            有効（推奨）
+          </label>
+        </div>
+
+        <!-- GPU Compute Acceleration (DirectML / Intel Arc) Toggle -->
+        <div style="display: flex; align-items: center; justify-content: space-between; margin-top: 10px; padding: 12px 16px; background: var(--md-sys-color-surface-container-high); border-radius: var(--md-sys-shape-corner-medium); border: 1px solid var(--md-sys-color-outline-variant);">
+          <div style="display: flex; align-items: center; gap: 10px;">
+            <span class="material-symbols-outlined" style="color: var(--md-sys-color-primary); font-size: 22px;">memory</span>
+            <div>
+              <span style="font-weight: 800; font-size: 0.92rem; color: var(--md-sys-color-on-surface);">GPU 加速 (DirectX 12 / DirectML)</span>
+              <span style="font-size: 0.78rem; color: var(--md-sys-color-secondary); display: block; margin-top: 2px;">DirectX 12 対応 GPU を使用して特徴量照合を高速化します（OFF時は CPU の最適化マルチスレッドで安定動作）</span>
+            </div>
+          </div>
+          <label style="display: flex; align-items: center; gap: 8px; cursor: pointer; font-weight: 800; font-size: 0.88rem; color: var(--md-sys-color-primary);">
+            <input type="checkbox" id="check-enable-gpu-dml" style="width: 18px; height: 18px; accent-color: var(--md-sys-color-primary); cursor: pointer;">
+            有効にする
+          </label>
+        </div>
+
+        <!-- Fast Coarse Feature Clipping (Stage 1 Spatial Subsampling) Toggle -->
+        <div style="display: flex; align-items: center; justify-content: space-between; margin-top: 10px; padding: 12px 16px; background: var(--md-sys-color-surface-container-high); border-radius: var(--md-sys-shape-corner-medium); border: 1px solid var(--md-sys-color-outline-variant);">
+          <div style="display: flex; align-items: center; gap: 10px;">
+            <span class="material-symbols-outlined" style="color: var(--md-sys-color-primary); font-size: 22px;">bolt</span>
+            <div>
+              <span style="font-weight: 800; font-size: 0.92rem; color: var(--md-sys-color-on-surface);">高速照合モード (粗探索サンプリング)</span>
+              <span style="font-size: 0.78rem; color: var(--md-sys-color-secondary); display: block; margin-top: 2px;">特徴量を均等サンプリングして候補ページの絞り込みを高速化します（推奨。見つかりにくい極小コマなどはOFFにして全点照合）</span>
+            </div>
+          </div>
+          <label style="display: flex; align-items: center; gap: 8px; cursor: pointer; font-weight: 800; font-size: 0.88rem; color: var(--md-sys-color-primary);">
+            <input type="checkbox" id="check-enable-coarse-clip" checked style="width: 18px; height: 18px; accent-color: var(--md-sys-color-primary); cursor: pointer;">
+            有効（推奨）
+          </label>
+        </div>
+
+        <!-- Advanced Search Sliders (Min Panel Size) -->
+        <div style="margin-top: 12px; padding: 14px 18px; background: var(--md-sys-color-surface-container-high); border-radius: var(--md-sys-shape-corner-medium); border: 1px solid var(--md-sys-color-outline-variant); display: flex; flex-direction: column; gap: 14px;">
+          
+          <!-- Slider 2: Minimum Panel Size Ratio -->
+          <div>
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px;">
+              <span style="font-weight: 800; font-size: 0.88rem; color: var(--md-sys-color-on-surface); display: flex; align-items: center; gap: 6px;">
+                <span class="material-symbols-outlined" style="font-size: 18px; color: var(--md-sys-color-primary);">aspect_ratio</span>
+                📐 コマの小ささ許容度（最小コマサイズ比率）:
+              </span>
+              <span id="label-min-panel-area" class="m3-badge-status" style="font-size: 0.8rem; padding: 2px 10px;">
+                1.0% (標準・推奨)
+              </span>
+            </div>
+            <input type="range" id="slider-min-panel-area" min="0.5" max="8.0" step="0.5" value="1.0" style="width: 100%; accent-color: var(--md-sys-color-primary); cursor: pointer;">
+            <div style="display: flex; justify-content: space-between; font-size: 0.75rem; color: var(--md-sys-color-secondary); margin-top: 4px;">
+              <span>0.5% (極小コマ対応)</span>
+              <span>8.0% (大コマ重視)</span>
+            </div>
+          </div>
+
+        </div>
+      </div>
+
+      <!-- Search Results Area (Hidden initially) -->
+      <div id="results-container" style="display: none;">
+        
+        <div class="m3-search-grid">
+          
+          <!-- Left: Query Panel Info -->
+          <div class="m3-query-card">
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px;">
+              <h3 class="m3-card-title" style="font-size: 1.05rem; margin-bottom: 0;">
+                <span class="material-symbols-outlined" style="color: var(--md-sys-color-primary);">crop_original</span>
+                検索クエリ（入力コマ）
+              </h3>
+              <button class="m3-icon-btn" id="btn-clear-query" style="width: 32px; height: 32px; border-radius: 50%; border: none; background: transparent; color: var(--md-sys-color-outline); cursor: pointer; display: flex; align-items: center; justify-content: center;" title="検索結果とクエリ画像をクリア">
+                <span class="material-symbols-outlined" style="font-size: 20px;">close</span>
+              </button>
+            </div>
+            <img id="query-preview-img" class="m3-query-preview" alt="Query Panel">
+            <div id="query-meta" style="font-size: 0.88rem; color: var(--md-sys-color-on-surface-variant); line-height: 1.7;">
+              <!-- Meta filled by JS -->
+            </div>
+          </div>
+
+          <!-- Right: Matched Results -->
+          <div>
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 18px;">
+              <h3 class="m3-card-title" style="font-size: 1.3rem;">
+                <span class="material-symbols-outlined" style="color: var(--md-sys-color-primary);">verified</span>
+                特定結果
+              </h3>
+              <div style="display: flex; align-items: center; gap: 10px;">
+                <span id="results-count-badge" class="m3-result-badge">
+                  0 件検出
+                </span>
+                <button class="m3-btn m3-btn-outlined" id="btn-clear-results" style="height: 34px; padding: 0 12px; font-size: 0.82rem; border-radius: var(--md-sys-shape-corner-full); color: var(--md-sys-color-outline); border-color: var(--md-sys-color-outline-variant);" title="検索結果と入力画像をクリア">
+                  <span class="material-symbols-outlined" style="font-size: 18px;">clear_all</span>
+                  結果をクリア
+                </button>
+              </div>
+            </div>
+
+            <div id="results-list">
+              <!-- Result cards rendered here -->
+            </div>
+          </div>
+
+        </div>
+
+      </div>
+
+    </section>
+
+    <!-- TAB 2: Library Management -->
+    <section id="tab-library" class="m3-page-view">
+      
+      <div class="m3-card">
+        <div class="m3-card-header" style="flex-wrap: wrap; gap: 12px;">
+          <div>
+            <h2 class="m3-card-title">
+              <span class="material-symbols-outlined" style="color: var(--md-sys-color-primary);">collections_bookmark</span>
+              登録ライブラリ ＆ 検索対象フォルダ管理
+            </h2>
+            <p style="font-size: 0.88rem; font-weight: 700; color: var(--md-sys-color-secondary); margin-top: 6px;" id="library-dir-label">
+              読み込みディレクトリ: ...
+            </p>
+          </div>
+
+          <div style="display: flex; gap: 10px; flex-wrap: wrap;">
+            <button class="m3-btn m3-btn-filled" id="btn-create-folder" style="background-color: var(--md-sys-color-secondary);">
+              <span class="material-symbols-outlined">create_new_folder</span>
+              新規フォルダ作成
+            </button>
+            <button class="m3-btn m3-btn-outlined" id="btn-rescan">
+              <span class="material-symbols-outlined">refresh</span>
+              再スキャン
+            </button>
+            <button class="m3-btn m3-btn-filled" id="btn-start-index">
+              <span class="material-symbols-outlined">bolt</span>
+              インデックス事前作成
+            </button>
+          </div>
+        </div>
+
+        <!-- Filter & Selection Summary Toolbar -->
+        <div style="display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 12px; padding: 12px 16px; margin-top: 10px; background-color: var(--md-sys-color-surface-container-high); border-radius: var(--md-sys-shape-corner-medium); border: 1px solid var(--md-sys-color-outline-variant);">
+          <div style="display: flex; align-items: center; gap: 10px;">
+            <span class="material-symbols-outlined" style="color: var(--md-sys-color-primary);">check_circle</span>
+            <span id="library-selection-summary" style="font-size: 0.92rem; font-weight: 800; color: var(--md-sys-color-on-surface);">
+              検索対象: 読み込み中...
+            </span>
+          </div>
+          <div style="display: flex; gap: 8px;">
+            <button class="m3-btn m3-btn-tonal" id="btn-select-all" style="padding: 6px 12px; font-size: 0.82rem;">
+              <span class="material-symbols-outlined" style="font-size: 16px;">select_all</span>
+              すべて選択
+            </button>
+            <button class="m3-btn m3-btn-outlined" id="btn-deselect-all" style="padding: 6px 12px; font-size: 0.82rem;">
+              <span class="material-symbols-outlined" style="font-size: 16px;">deselect</span>
+              すべて解除
+            </button>
+          </div>
+        </div>
+
+        <!-- Indexing Progress Bar -->
+        <div id="index-progress-container" style="display: none; margin: 18px 0;">
+          <div style="display: flex; justify-content: space-between; font-size: 0.9rem; font-weight: 800; margin-bottom: 6px;">
+            <span id="index-status-text" style="color: var(--md-sys-color-on-surface);">特徴量を事前抽出中...</span>
+            <span id="index-percent-text" style="color: var(--md-sys-color-primary); font-family: var(--m3-font-brand);">0%</span>
+          </div>
+          <div class="m3-linear-progress active" style="display: block;">
+            <div class="bar" id="index-progress-bar" style="width: 0%;"></div>
+          </div>
+        </div>
+
+        <!-- Folder Groups Container -->
+        <div id="library-groups-container" style="margin-top: 18px;">
+          <div style="text-align: center; color: var(--md-sys-color-outline); padding: 40px;">
+            ライブラリを読み込み中...
+          </div>
+        </div>
+
+      </div>
+
+    </section>
+
+    <!-- TAB 3: Settings -->
+    <section id="tab-settings" class="m3-page-view">
+      
+      <!-- Color Presets Card -->
+      <div class="m3-card">
+        <h2 class="m3-card-title" style="margin-bottom: 16px;">
+          <span class="material-symbols-outlined" style="color: var(--md-sys-color-primary);">palette</span>
+          カラーテーマプリセット
+        </h2>
+
+        <div class="m3-preset-grid" id="theme-preset-grid">
+          <!-- Preset 1 -->
+          <div class="m3-preset-card active" data-preset="titanium_slate">
+            <span class="m3-preset-dot" style="background-color: #a8c7fa;"></span>
+            <div>
+              <div style="font-family: var(--m3-font-brand); font-weight: 800; font-size: 0.95rem;">Titanium Slate</div>
+              <div style="font-size: 0.75rem; color: var(--md-sys-color-secondary);">標準チタンスレート</div>
+            </div>
+          </div>
+
+          <!-- Preset 2 -->
+          <div class="m3-preset-card" data-preset="material_lavender">
+            <span class="m3-preset-dot" style="background-color: #d0bcff;"></span>
+            <div>
+              <div style="font-family: var(--m3-font-brand); font-weight: 800; font-size: 0.95rem;">Material Lavender</div>
+              <div style="font-size: 0.75rem; color: var(--md-sys-color-secondary);">M3 ベースライン</div>
+            </div>
+          </div>
+
+          <!-- Preset 3 -->
+          <div class="m3-preset-card" data-preset="nordic_emerald">
+            <span class="m3-preset-dot" style="background-color: #82d9a7;"></span>
+            <div>
+              <div style="font-family: var(--m3-font-brand); font-weight: 800; font-size: 0.95rem;">Nordic Emerald</div>
+              <div style="font-size: 0.75rem; color: var(--md-sys-color-secondary);">北欧フォレスト</div>
+            </div>
+          </div>
+
+          <!-- Preset 4 -->
+          <div class="m3-preset-card" data-preset="amber_bronze">
+            <span class="m3-preset-dot" style="background-color: #f0c068;"></span>
+            <div>
+              <div style="font-family: var(--m3-font-brand); font-weight: 800; font-size: 0.95rem;">Amber Bronze</div>
+              <div style="font-size: 0.75rem; color: var(--md-sys-color-secondary);">クラシックアンバー</div>
+            </div>
+          </div>
+
+          <!-- Preset 5 -->
+          <div class="m3-preset-card" data-preset="sakura_rose">
+            <span class="m3-preset-dot" style="background-color: #ffb1c8;"></span>
+            <div>
+              <div style="font-family: var(--m3-font-brand); font-weight: 800; font-size: 0.95rem;">Sakura Rose</div>
+              <div style="font-size: 0.75rem; color: var(--md-sys-color-secondary);">和風サクラローズ</div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Path Settings Card (Multiple Folders & Files) -->
+      <div class="m3-card">
+        <h2 class="m3-card-title" style="margin-bottom: 8px;">
+          <span class="material-symbols-outlined" style="color: var(--md-sys-color-primary);">folder_shared</span>
+          登録パス管理（フォルダー ＆ 単体ファイル）
+        </h2>
+        <p style="font-size: 0.85rem; font-weight: 500; color: var(--md-sys-color-secondary); margin-bottom: 16px;">
+          複数の漫画フォルダ、または個別のアーカイブファイル（.cbz, .rar, .zip, .7z, 画像等）を登録できます。
+        </p>
+
+        <!-- Current Paths List -->
+        <div id="target-paths-list" style="display: flex; flex-direction: column; gap: 8px; margin-bottom: 20px;">
+          <!-- Loaded dynamically by JS -->
+        </div>
+
+        <!-- Add New Path Form & Explorer Pickers -->
+        <div style="display: flex; flex-direction: column; gap: 12px;">
+          <label style="font-weight: 800; font-size: 0.95rem; color: var(--md-sys-color-on-surface);">
+            新規フォルダーまたはファイルの追加
+          </label>
+
+          <!-- Explorer Picker Buttons (Primary Choice) -->
+          <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 12px;">
+            <button class="m3-btn m3-btn-filled" id="btn-browse-folder" style="height: 52px; font-size: 0.95rem; border-radius: var(--md-sys-shape-corner-medium);">
+              <span class="material-symbols-outlined" style="font-size: 22px;">drive_folder_upload</span>
+              エクスプローラーでフォルダを選択
+            </button>
+            <button class="m3-btn m3-btn-tonal" id="btn-browse-files" style="height: 52px; font-size: 0.95rem; border-radius: var(--md-sys-shape-corner-medium);">
+              <span class="material-symbols-outlined" style="font-size: 22px;">upload_file</span>
+              エクスプローラーでファイルを選択
+            </button>
+          </div>
+
+          <!-- Drag & Drop Zone -->
+          <div id="path-dropzone" style="border: 2px dashed var(--md-sys-color-outline-variant); border-radius: var(--md-sys-shape-corner-medium); padding: 18px; text-align: center; background: var(--md-sys-color-surface-container-lowest); cursor: pointer; transition: border-color 0.2s, background-color 0.2s;">
+            <div style="display: flex; align-items: center; justify-content: center; gap: 8px; color: var(--md-sys-color-secondary); font-weight: 700; font-size: 0.88rem;">
+              <span class="material-symbols-outlined" style="color: var(--md-sys-color-primary);">drag_and_drop</span>
+              または、漫画フォルダやファイルをここに直接ドラッグ＆ドロップ
+            </div>
+          </div>
+
+          <!-- Manual Path Input (Secondary / Advanced) -->
+          <details style="margin-top: 4px;">
+            <summary style="font-size: 0.82rem; font-weight: 700; color: var(--md-sys-color-secondary); cursor: pointer; user-select: none;">
+              パスを直接キーボードで手入力する場合はこちら
+            </summary>
+            <div style="display: flex; gap: 10px; margin-top: 10px;">
+              <input type="text" id="input-new-path" placeholder="例: D:\Manga\OnePiece または C:\Downloads\vol1.cbz" 
+                     style="flex: 1; padding: 10px 14px; border-radius: var(--md-sys-shape-corner-small); border: 1px solid var(--md-sys-color-outline-variant); background: var(--md-sys-color-surface-container-lowest); color: var(--md-sys-color-on-surface); font-family: var(--m3-font-body); font-weight: 700; font-size: 0.9rem;">
+              <button class="m3-btn m3-btn-outlined" id="btn-add-path">
+                <span class="material-symbols-outlined">add</span>
+                手動追加
+              </button>
+            </div>
+          </details>
+
+          <p style="font-size: 0.78rem; font-weight: 700; color: var(--md-sys-color-outline);">
+            ※ 対応形式: フォルダー、または .cbz, .cbr, .cbt, .cb7, .zip, .rar, .tar, .7z, .jpg, .png 単体ファイル
+          </p>
+        </div>
+
+          <div style="border-top: 1px solid var(--md-sys-color-outline-variant); padding-top: 18px;">
+            <label style="font-weight: 800; display: block; margin-bottom: 8px; font-size: 0.92rem; color: var(--md-sys-color-on-surface);">
+              検索の許容最小スコア (Min Score)
+            </label>
+            <input type="range" id="setting-min-score" min="0.10" max="0.80" step="0.05" value="0.20" style="width: 100%; accent-color: var(--md-sys-color-primary);">
+            <div style="display: flex; justify-content: space-between; font-size: 0.85rem; font-weight: 800; color: var(--md-sys-color-secondary); margin-top: 6px;">
+              <span>緩め (0.10)</span>
+              <span id="label-min-score" style="color: var(--md-sys-color-primary); font-family: var(--m3-font-brand);">0.20</span>
+              <span>厳格 (0.80)</span>
+            </div>
+          </div>
+        </div>
+
+      </div>
+
+    </section>
+
+  </main>
+
+  <!-- Create Folder Modal Dialog -->
+  <div id="modal-create-folder" style="display: none; position: fixed; inset: 0; background-color: rgba(0, 0, 0, 0.65); z-index: 1000; align-items: center; justify-content: center; backdrop-filter: blur(4px);">
+    <div style="background: var(--md-sys-color-surface-container); border: 1px solid var(--md-sys-color-outline-variant); border-radius: var(--md-sys-shape-corner-large); width: 90%; max-width: 440px; padding: 24px; box-shadow: var(--md-sys-elevation-level3);">
+      <div style="display: flex; align-items: center; gap: 10px; margin-bottom: 16px;">
+        <span class="material-symbols-outlined" style="color: var(--md-sys-color-primary); font-size: 28px;">create_new_folder</span>
+        <h3 style="margin: 0; font-family: var(--m3-font-brand); font-weight: 800; font-size: 1.2rem; color: var(--md-sys-color-on-surface);">
+          新規作品フォルダの作成
+        </h3>
+      </div>
+      <p style="font-size: 0.85rem; color: var(--md-sys-color-secondary); margin-bottom: 14px;">
+        単行本を作品ごとに分類・管理するためのフォルダ名を入力してください（例: らんま1/2、犬夜叉など）。
+      </p>
+      <input type="text" id="input-folder-name" placeholder="フォルダ名（作品名）" 
+             style="width: 100%; box-sizing: border-box; padding: 12px 14px; border-radius: var(--md-sys-shape-corner-small); border: 1.5px solid var(--md-sys-color-outline-variant); background: var(--md-sys-color-surface-container-lowest); color: var(--md-sys-color-on-surface); font-family: var(--m3-font-body); font-weight: 700; font-size: 0.95rem; margin-bottom: 20px;">
+      <div style="display: flex; justify-content: flex-end; gap: 10px;">
+        <button class="m3-btn m3-btn-outlined" id="btn-cancel-folder">キャンセル</button>
+        <button class="m3-btn m3-btn-filled" id="btn-confirm-create-folder">作成</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Footer -->
+  <footer>
+    <p>MANGA PANEL SEARCH &bull; MATERIAL DESIGN 3 TITANIUM SLATE SPECIFICATION</p>
+  </footer>
+
+  <!-- App Script -->
+  <script src="/static/js/app.js"></script>
+</body>
+</html>

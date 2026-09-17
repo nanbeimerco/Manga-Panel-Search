@@ -1,0 +1,61 @@
+{
+  "name": "manga-panel-search",
+  "version": "1.0.8",
+  "description": "High-Precision Manga Panel Search Desktop Application with Material 3 UI",
+  "main": "electron/main.js",
+  "scripts": {
+    "start": "electron .",
+    "dist": "electron-builder --win --x64"
+  },
+  "keywords": [
+    "manga",
+    "opencv",
+    "sift",
+    "electron"
+  ],
+  "author": "nanbeimerco",
+  "license": "MIT",
+  "devDependencies": {
+    "electron": "^33.2.1",
+    "electron-builder": "^25.1.8"
+  },
+  "build": {
+    "appId": "com.mangapanel.search",
+    "productName": "Manga Panel Search",
+    "copyright": "Copyright © 2026 nanbeimerco",
+    "directories": {
+      "output": "release_installer"
+    },
+    "extraResources": [
+      {
+        "from": "backend_dist/manga_backend",
+        "to": "manga_backend",
+        "filter": [
+          "**/*"
+        ]
+      }
+    ],
+    "win": {
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        }
+      ]
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "Manga Panel Search"
+    },
+    "files": [
+      "electron/**/*",
+      "static/**/*",
+      "package.json"
+    ]
+  }
+}

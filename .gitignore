@@ -1,0 +1,47 @@
+﻿# Node dependencies
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Build outputs & installers
+dist/
+build/
+backend_dist/
+release_installer/
+*.exe
+*.apk
+
+# Python caches and virtual environments
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+env/
+venv/
+*.egg-info/
+.pytest_cache/
+
+# User data, test images, and feature caches
+data/
+.cache_descriptors/
+.cache_test/
+scratch/
+scratch_features/
+config_paths.json
+
+# Android build files
+android/.gradle/
+android/build/
+android/app/build/
+android/local.properties
+android/.idea/
+*.keystore
+
+# Reference repositories
+liquid-glass-studio-main/
+
+# OS specific
+Thumbs.db
+Desktop.ini
+.DS_Store
