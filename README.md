@@ -1,4 +1,4 @@
-﻿# Manga Panel Search (漫画コマ検索)
+# Manga Panel Search (漫画コマ検索)
 
 漫画の1コマやスマートフォンの撮影写真、切り抜き画像から、ライブラリ内の全巻・全ページを照合し、該当する「作品名・巻数・ページ番号・コマの正確な位置」を特定するデスクトップアプリケーションです。
 
@@ -32,7 +32,7 @@ Google Material Design 3 (M3) に準拠したUIと、コンピュータビジョ
 最も簡単な方法は、ビルド済みインストーラーを使用することです。Python や Node.js のインストールは不要です。
 
 1. [GitHub Releases](https://github.com/nanbeimerco/Manga-Panel-Search/releases) ページにアクセスします。
-2. 最新リリースの `Manga Panel Search Setup 1.0.8.exe` をダウンロードします。
+2. 最新リリースの `Manga Panel Search Setup 1.0.9.exe` をダウンロードします。
 3. ダウンロードしたインストーラーを実行し、画面の指示に従ってインストールを完了してください。
 4. デスクトップまたはスタートメニューのショートカットからアプリを起動できます。
 
