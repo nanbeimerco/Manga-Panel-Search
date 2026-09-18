@@ -1,6 +1,6 @@
 {
   "name": "manga-panel-search",
-  "version": "1.0.8",
+  "version": "1.0.9",
   "description": "High-Precision Manga Panel Search Desktop Application with Material 3 UI",
   "main": "electron/main.js",
   "scripts": {
