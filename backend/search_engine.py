@@ -5,10 +5,13 @@ and RANSAC Homography for robust geometric verification and bounding box localiz
 Optimized with RAM caching, multi-thread parallel matching, and adaptive paper illumination normalization.
 """
 
+import gc
 import heapq
 import os
 import pickle
+import re
 import threading
+from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -233,6 +236,102 @@ def normalize_manga_photo(img: np.ndarray) -> np.ndarray:
     return stretched
 
 
+class BoundedMemoryCache:
+    """Thread-safe LRU in-memory feature cache with bounded capacity to prevent OOM."""
+
+    def __init__(self, max_entries: int = 500):
+        self.max_entries = max_entries
+        self._cache: OrderedDict[str, Any] = OrderedDict()
+        self._lock = threading.Lock()
+
+    def get(self, key: str) -> Optional[Any]:
+        with self._lock:
+            if key in self._cache:
+                self._cache.move_to_end(key)
+                return self._cache[key]
+            return None
+
+    def put(self, key: str, value: Any):
+        with self._lock:
+            if key in self._cache:
+                self._cache.move_to_end(key)
+                self._cache[key] = value
+            else:
+                self._cache[key] = value
+                if len(self._cache) > self.max_entries:
+                    self._cache.popitem(last=False)
+
+    def clear(self):
+        with self._lock:
+            self._cache.clear()
+
+    def __len__(self) -> int:
+        with self._lock:
+            return len(self._cache)
+
+
+def parse_manga_volume_and_page(archive_name: str, page_filename: str, page_number: int) -> Dict[str, Any]:
+    """
+    Parse archive name and page filename to determine volume name and within-volume page number.
+    e.g.:
+      - archive: '(一般コミック) [高橋留美子] 犬夜叉Inuyasha 全56巻.zip', filename: '《犬夜叉》Vol_02/inu02169.jpg'
+        -> volume: 'Vol.02', volume_page: 169, label: '第02巻 169ページ (通算 363ページ)'
+      - archive: '(一般コミック) [高橋留美子] らんま1／2 第10巻.rar', filename: '174.png'
+        -> volume: '第10巻', volume_page: 174, label: '第10巻 174ページ'
+    """
+    clean_filename = page_filename.replace("\\", "/")
+    parts = clean_filename.split("/")
+
+    vol_str = ""
+    vol_num = None
+    page_in_vol = None
+
+    # Case 1: check subfolder in archive (e.g. '《犬夜叉》Vol_02/inu02169.jpg')
+    if len(parts) > 1:
+        folder = parts[0]
+        m_vol = re.search(r"(?:vol(?:ume)?|第)?\s*[\._\-]?\s*(\d+)(?:\s*巻)?", folder, re.IGNORECASE)
+        if m_vol:
+            vol_num = int(m_vol.group(1))
+            vol_str = f"第{vol_num:02d}巻" if ("第" in folder or "巻" in folder) else f"Vol.{vol_num:02d}"
+
+    # If no subfolder volume found, check archive_name (e.g. '第10巻.rar')
+    if not vol_str:
+        m_vol_arc = re.search(r"(?:vol(?:ume)?|第)\s*[\._\-]?\s*(\d+)(?:\s*巻)?", archive_name, re.IGNORECASE)
+        if m_vol_arc:
+            vol_num = int(m_vol_arc.group(1))
+            vol_str = f"第{vol_num:02d}巻"
+
+    # Extract page number within volume from the file basename (e.g. inu02169.jpg -> 169, page174.png -> 174)
+    basename = parts[-1]
+    name_no_ext = os.path.splitext(basename)[0]
+    m_page = re.search(r"(?:page|p|_|-)?(\d+)$", name_no_ext, re.IGNORECASE)
+    if m_page:
+        num_str = m_page.group(1)
+        if vol_num is not None and len(num_str) >= 4 and num_str.startswith(f"{vol_num:02d}"):
+            page_in_vol = int(num_str[len(f"{vol_num:02d}"):])
+        else:
+            page_in_vol = int(num_str)
+
+    # Format human-friendly display label
+    if vol_str and page_in_vol is not None:
+        if len(parts) > 1:
+            display_label = f"{vol_str} {page_in_vol}ページ (通算 {page_number}ページ)"
+        else:
+            display_label = f"{vol_str} {page_in_vol}ページ"
+    elif vol_str:
+        display_label = f"{vol_str} {page_number}ページ"
+    elif page_in_vol is not None:
+        display_label = f"PAGE {page_in_vol}"
+    else:
+        display_label = f"PAGE {page_number}"
+
+    return {
+        "volume_name": vol_str,
+        "volume_page": page_in_vol,
+        "display_page_label": display_label,
+    }
+
+
 class SearchResult:
     def __init__(
         self,
@@ -258,6 +357,11 @@ class SearchResult:
         self.polygon = polygon or []
         self.aspect_ratio_discrepancy = round(float(aspect_ratio_discrepancy), 3)
 
+        vol_meta = parse_manga_volume_and_page(self.archive_name, self.page_filename, self.page_number)
+        self.volume_name = vol_meta["volume_name"]
+        self.volume_page = vol_meta["volume_page"]
+        self.display_page_label = vol_meta["display_page_label"]
+
     @property
     def page_number(self) -> int:
         return self.page_index + 1
@@ -269,6 +373,9 @@ class SearchResult:
             "page_index": self.page_index,
             "page_number": self.page_number,
             "page_filename": self.page_filename,
+            "volume_name": self.volume_name,
+            "volume_page": self.volume_page,
+            "display_page_label": self.display_page_label,
             "score": round(float(self.score), 4),
             "inliers_count": int(self.inliers_count),
             "total_matches": int(self.total_matches),
@@ -286,9 +393,8 @@ class MangaSearchEngine:
         self.cache_dir = cache_dir or Path(".cache_descriptors")
         self.cache_dir.mkdir(parents=True, exist_ok=True)
 
-        # In-Memory RAM Cache to eliminate repeated disk I/O
-        # Stores: (pts, descs, shape, bovw_hist)
-        self._memory_cache: Dict[str, Tuple[np.ndarray, Optional[np.ndarray], Tuple[int, int], np.ndarray]] = {}
+        # In-Memory Bounded LRU Cache to eliminate repeated disk I/O while capping RAM usage
+        self._memory_cache = BoundedMemoryCache(max_entries=600)
         self._cache_lock = threading.Lock()
 
         # Thread pool for parallel matching (matches CPU logical cores)
@@ -364,10 +470,10 @@ class MangaSearchEngine:
         """Retrieve features from in-memory RAM cache, disk cache, or compute fresh."""
         cache_key = self.get_cache_key(archive.name, page_index)
 
-        # 1. Fast path: In-Memory RAM Cache (nanosecond lookup, zero disk I/O)
-        with self._cache_lock:
-            if cache_key in self._memory_cache:
-                return self._memory_cache[cache_key]
+        # 1. Fast path: In-Memory Bounded LRU Cache (nanosecond lookup, zero disk I/O)
+        cached = self._memory_cache.get(cache_key)
+        if cached is not None:
+            return cached
 
         # 2. Disk Cache
         cache_path = self.get_cache_path(archive, page_index)
@@ -382,8 +488,7 @@ class MangaSearchEngine:
                     else:
                         p_norm = None
                     entry = (data["pts"], p_norm, data["shape"])
-                    with self._cache_lock:
-                        self._memory_cache[cache_key] = entry
+                    self._memory_cache.put(cache_key, entry)
                     return entry
             except Exception:
                 pass
@@ -411,8 +516,7 @@ class MangaSearchEngine:
             p_norm = None
 
         entry = (pts, p_norm, (w, h))
-        with self._cache_lock:
-            self._memory_cache[cache_key] = entry
+        self._memory_cache.put(cache_key, entry)
         return entry
 
     def match_query_to_page(
@@ -435,11 +539,18 @@ class MangaSearchEngine:
         if len(query_descs) < 8 or len(page_descs) < 8:
             return None
 
+        # Ensure consistent L2 normalization between query and page descriptors for Euclidean distance
+        q_norm = query_descs.astype(np.float32)
+        q_norm /= (np.linalg.norm(q_norm, axis=1, keepdims=True) + 1e-7)
+
+        p_norm = page_descs.astype(np.float32)
+        p_norm /= (np.linalg.norm(p_norm, axis=1, keepdims=True) + 1e-7)
+
         # KNN Match
         try:
-            matches = self.flann.knnMatch(query_descs, page_descs, k=2)
+            matches = self.flann.knnMatch(q_norm, p_norm, k=2)
         except Exception:
-            matches = self.bf.knnMatch(query_descs, page_descs, k=2)
+            matches = self.bf.knnMatch(q_norm, p_norm, k=2)
 
         good_matches = []
         for m_pair in matches:
@@ -645,6 +756,9 @@ class MangaSearchEngine:
                         if sc > candidate_heap[0][0]:
                             heapq.heapreplace(candidate_heap, (sc, curr_idx))
 
+                # Immediately discard large batch matrices to free RAM
+                del P_concat, sim_concat, batch_descs, batch_meta
+
             processed_count += len(batch_items)
             if progress_callback:
                 # Scale Stage 1 to 0% - 90%
@@ -770,6 +884,9 @@ class MangaSearchEngine:
         # Release GPU shared memory immediately if DirectML was mobilized
         if use_gpu_dml:
             dml_runner.cleanup()
+
+        # Run garbage collection to return discarded feature matrices to OS
+        gc.collect()
 
         # Sort descending by score & inliers
         results.sort(key=lambda r: (r.score, r.inliers_count), reverse=True)

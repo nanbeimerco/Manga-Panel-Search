@@ -530,8 +530,8 @@ document.addEventListener('DOMContentLoaded', () => {
         <div class="m3-result-header">
           <div>
             <span class="m3-result-title">${res.archive_name}</span>
-            <div style="font-size: 0.95rem; font-weight: 800; color: var(--md-sys-color-primary); margin-top: 6px; font-family: var(--m3-font-brand);">
-              PAGE ${res.page_number} <span style="color: var(--md-sys-color-secondary); font-size: 0.85rem; font-weight: 700;">(${res.page_filename})</span>
+            <div style="font-size: 0.98rem; font-weight: 800; color: var(--md-sys-color-primary); margin-top: 6px; font-family: var(--m3-font-brand);">
+              ${res.display_page_label || `PAGE ${res.page_number}`} <span style="color: var(--md-sys-color-secondary); font-size: 0.82rem; font-weight: 700; margin-left: 4px;">(${res.page_filename})</span>
             </div>
           </div>
           <div style="display: flex; gap: 10px; align-items: center; flex-wrap: wrap;">
