@@ -31,6 +31,7 @@ app.add_middleware(
 import os
 import shutil
 import sys
+import threading
 
 # Robust path resolution for dev environment and PyInstaller bundles
 if getattr(sys, "frozen", False):
@@ -113,12 +114,35 @@ migrate_legacy_data()
 from backend.library_manager import LibraryGroupManager
 
 # Engine & Manager Singletons
-engine = MangaSearchEngine(max_features=2000, cache_dir=CACHE_DIR)
-library = LibraryManager(data_dir=DATA_DIR, engine=engine, config_file=CONFIG_FILE)
+# index_v2 holds the per-archive feature store and the faiss index; the old per-page
+# pickle cache (CACHE_DIR) is only read once to migrate existing features.
+INDEX_DIR = USER_DATA_DIR / "index_v2"
+engine = MangaSearchEngine(cache_dir=INDEX_DIR, legacy_cache_dir=CACHE_DIR)
+library = LibraryManager(data_dir=DATA_DIR, engine=engine, config_file=CONFIG_FILE, scan_now=False)
 group_manager = LibraryGroupManager(config_file=GROUPS_CONFIG_FILE)
+_startup_done = threading.Event()
 
-if library.archives:
-    group_manager.auto_organize_if_empty([a.name for a in library.archives])
+
+def _startup_worker():
+    """Scan the library and warm up the index after the server is already answering."""
+    try:
+        library.refresh_library()
+        if library.archives:
+            group_manager.auto_organize_if_empty([a.name for a in library.archives])
+        engine.load_index()
+    finally:
+        _startup_done.set()
+    # Build features for anything new (also migrates the old cache) and sync the index.
+    library.start_indexing()
+
+
+@app.on_event("startup")
+def _on_startup():
+    threading.Thread(target=_startup_worker, daemon=True).start()
+
+
+def wait_for_library(timeout: float = 60.0) -> None:
+    _startup_done.wait(timeout)
 
 
 class SetDirRequest(BaseModel):
@@ -134,6 +158,7 @@ def get_status():
 @app.get("/api/library")
 def get_library():
     """List all registered manga archives and their details."""
+    wait_for_library()
     return {"archives": library.get_library_summary(), "data_dir": str(library.data_dir)}
 
 
@@ -249,6 +274,7 @@ class ToggleRequest(BaseModel):
 @app.get("/api/groups")
 def get_groups():
     """Get folder grouping structure with checked states and counts."""
+    wait_for_library()
     if not library.archives:
         library.refresh_library()
     all_names = [a.name for a in library.archives]
@@ -347,7 +373,7 @@ import threading
 async def search_stream(
     file: UploadFile = File(...),
     top_k: int = Form(5),
-    min_score: float = Form(0.20),
+    min_score: float = Form(0.30),
     normalize_photo: bool = Form(True),
     min_panel_area_percent: float = Form(1.0),
     enable_gpu_dml: bool = Form(False),
@@ -368,6 +394,7 @@ async def search_stream(
     if query_img is None:
         raise HTTPException(status_code=400, detail="Invalid image file or cannot decode.")
 
+    await asyncio.get_running_loop().run_in_executor(None, wait_for_library)
     if not library.archives:
         library.refresh_library()
 
@@ -388,11 +415,10 @@ async def search_stream(
     loop = asyncio.get_running_loop()
     async_q = asyncio.Queue()
 
-    def on_progress(current, total):
-        pct = round((current / max(1, total)) * 100, 1)
+    def on_progress(pct, stage):
         loop.call_soon_threadsafe(
             async_q.put_nowait,
-            {"type": "progress", "current": current, "total": total, "percent": pct}
+            {"type": "progress", "percent": round(float(pct), 1), "stage": stage}
         )
 
     def worker():
@@ -450,7 +476,7 @@ async def search_stream(
 async def search_panel(
     file: UploadFile = File(...),
     top_k: int = Form(5),
-    min_score: float = Form(0.20),
+    min_score: float = Form(0.30),
     normalize_photo: bool = Form(True),
     min_panel_area_percent: float = Form(1.0),
     enable_gpu_dml: bool = Form(False),
@@ -472,6 +498,7 @@ async def search_panel(
         raise HTTPException(status_code=400, detail="Invalid image file or cannot decode.")
 
     # Refresh library if empty
+    await asyncio.get_running_loop().run_in_executor(None, wait_for_library)
     if not library.archives:
         library.refresh_library()
 

@@ -1,13 +1,13 @@
 # -*- mode: python ; coding: utf-8 -*-
-from PyInstaller.utils.hooks import collect_all
+from PyInstaller.utils.hooks import collect_dynamic_libs
 
-datas = [('static', 'static'), ('backend/matmul.onnx', 'backend')]
+datas = [('static', 'static')]
 binaries = []
 hiddenimports = []
-tmp_ret = collect_all('onnxruntime')
-datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
-tmp_ret = collect_all('numba')
-datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
+# Only faiss's core module and DLLs. collect_all() would also pull faiss.contrib, which
+# drags in torch / scipy / transformers (~500 MB) that the app never uses.
+binaries += collect_dynamic_libs('faiss')
+hiddenimports += ['faiss', 'faiss.loader', 'faiss.swigfaiss']
 
 
 a = Analysis(
@@ -19,7 +19,9 @@ a = Analysis(
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=[],
+    excludes=['numba', 'llvmlite', 'onnxruntime', 'tkinter', 'matplotlib',
+              'torch', 'torchvision', 'transformers', 'tokenizers', 'scipy', 'sklearn', 'pandas',
+              'faiss.contrib', 'yt_dlp', 'curl_cffi', 'IPython', 'jupyter_client', 'notebook'],
     noarchive=False,
     optimize=0,
 )
@@ -34,7 +36,7 @@ exe = EXE(
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
-    upx=True,
+    upx=False,
     console=False,
     disable_windowed_traceback=False,
     argv_emulation=False,
@@ -47,7 +49,7 @@ coll = COLLECT(
     a.binaries,
     a.datas,
     strip=False,
-    upx=True,
+    upx=False,
     upx_exclude=[],
     name='manga_backend',
 )

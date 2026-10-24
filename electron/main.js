@@ -1,4 +1,4 @@
-const { app, BrowserWindow, ipcMain, dialog } = require('electron');
+const { app, BrowserWindow, ipcMain, dialog, nativeTheme } = require('electron');
 const path = require('path');
 const http = require('http');
 const { spawn, exec } = require('child_process');
@@ -95,8 +95,8 @@ async function ensureBackendRunning() {
     backendProcess = null;
   });
 
-  // Poll until backend is ready (up to 30 seconds)
-  const maxRetries = 60;
+  // Poll until backend is ready (up to 3 minutes; the splash screen is visible meanwhile)
+  const maxRetries = 360;
   for (let i = 0; i < maxRetries; i++) {
     await new Promise((r) => setTimeout(r, 500));
     const ready = await checkBackendReady();
@@ -135,7 +135,7 @@ function createWindow() {
     minHeight: 600,
     frame: false, // Frameless window: eliminates ugly default OS title bar
     titleBarStyle: 'hidden',
-    backgroundColor: '#141218',
+    backgroundColor: nativeTheme.shouldUseDarkColors ? '#202020' : '#f3f3f3',
     show: false,
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
@@ -154,6 +154,8 @@ function createWindow() {
     if (mainWindow) mainWindow.webContents.send('window-maximize-changed', false);
   });
 
+  mainWindow.on('closed', () => { mainWindow = null; });
+
   mainWindow.once('ready-to-show', () => {
     mainWindow.show();
   });
@@ -161,8 +163,26 @@ function createWindow() {
   // Clear cache to always ensure latest HTML/JS/CSS assets
   mainWindow.webContents.session.clearCache();
 
-  // Load backend URL
-  mainWindow.loadURL(SERVER_URL);
+  // Show a local splash screen right away; the app page loads once the backend answers.
+  mainWindow.loadURL('data:text/html;charset=utf-8,' + encodeURIComponent(splashHtml('起動しています…')));
+}
+
+function splashHtml(message, isError = false) {
+  const dark = nativeTheme.shouldUseDarkColors;
+  const bg = dark ? '#202020' : '#f3f3f3';
+  const fg = dark ? '#ffffff' : '#242424';
+  const sub = dark ? '#adadad' : '#616161';
+  const brand = dark ? '#479ef5' : '#0f6cbd';
+  return `<!doctype html><html><head><meta charset="utf-8"><style>
+    html,body{margin:0;height:100%;background:${bg};color:${fg};font-family:"Segoe UI Variable","Segoe UI",sans-serif;-webkit-app-region:drag;user-select:none}
+    .c{height:100%;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:16px}
+    .t{font-size:20px;font-weight:600}.s{font-size:14px;color:${sub}}
+    .sp{width:32px;height:32px;border-radius:50%;border:3px solid ${brand}33;border-top-color:${brand};animation:r 1s linear infinite}
+    @keyframes r{to{transform:rotate(360deg)}}
+  </style></head><body><div class="c">
+    ${isError ? '' : '<div class="sp"></div>'}
+    <div class="t">Manga Panel Search</div><div class="s">${message}</div>
+  </div></body></html>`;
 }
 
 // Window IPC handlers
@@ -215,8 +235,15 @@ ipcMain.handle('dialog-select-files', async () => {
 
 // App Lifecycle
 app.whenReady().then(async () => {
-  await ensureBackendRunning();
   createWindow();
+  const ok = await ensureBackendRunning();
+  if (!mainWindow) return;
+  if (ok) {
+    mainWindow.loadURL(SERVER_URL);
+  } else {
+    mainWindow.loadURL('data:text/html;charset=utf-8,' + encodeURIComponent(
+      splashHtml('バックエンドを起動できませんでした。アプリを再起動してください。', true)));
+  }
 
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) {

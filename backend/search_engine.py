@@ -1,188 +1,37 @@
 """
-Search Engine for Manga Panel Matching.
-Uses SIFT (Scale-Invariant Feature Transform), FLANN / BFMatcher,
-and RANSAC Homography for robust geometric verification and bounding box localization.
-Optimized with RAM caching, multi-thread parallel matching, and adaptive paper illumination normalization.
+Search engine for manga panel matching.
+
+Pipeline:
+  1. SIFT (RootSIFT) features of the query at two scales.
+  2. Stage 1 - every query descriptor looks up its nearest page descriptors in a faiss
+     index over the whole library; each hit votes for its page. This narrows thousands
+     of pages to a few dozen candidates in well under a second.
+  3. Stage 2 - each candidate is matched exactly (ratio test + one-to-one constraint)
+     and verified with RANSAC; the inlier count decides the result and the panel box.
 """
 
 import gc
-import heapq
 import os
-import pickle
 import re
 import threading
-from collections import OrderedDict
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
-import numba
 
-@numba.njit(fastmath=True)
-def _compute_page_lowe_score(sim: np.ndarray) -> float:
-    M, N = sim.shape
-    if N < 2 or M == 0:
-        return 0.0
-
-    seen = np.zeros(N, dtype=numba.boolean)
-    margin_sum = 0.0
-
-    for i in range(M):
-        m1 = -1.0
-        m2 = -1.0
-        best_j = -1
-        for j in range(N):
-            val = sim[i, j]
-            if val > m1:
-                m2 = m1
-                m1 = val
-                best_j = j
-            elif val > m2:
-                m2 = val
-
-        d1_sq = 2.0 - 2.0 * m1
-        if d1_sq < 0.0:
-            d1_sq = 0.0
-        d2_sq = 2.0 - 2.0 * m2
-        if d2_sq < 0.0:
-            d2_sq = 0.0
-
-        if d1_sq < 0.5625 * d2_sq and best_j >= 0:
-            seen[best_j] = True
-            margin = m1 - m2
-            if margin > 0.05 and m1 >= 0.60:
-                margin_sum += (margin - 0.05)
-
-    unique_count = 0.0
-    for j in range(N):
-        if seen[j]:
-            unique_count += 1.0
-
-    return unique_count * 5.0 + margin_sum * 1.5
-
-@numba.njit(parallel=True, fastmath=True)
-def _batch_compute_lowe_scores(sim_concat: np.ndarray, meta: np.ndarray) -> np.ndarray:
-    num_pages = len(meta)
-    scores = np.empty(num_pages, dtype=np.float32)
-    for p in numba.prange(num_pages):
-        start = meta[p, 0]
-        sz = meta[p, 1]
-        sim_page = sim_concat[:, start : start + sz]
-        scores[p] = _compute_page_lowe_score(sim_page)
-    return scores
-
-# Module-level JIT warmup
-try:
-    _ = _batch_compute_lowe_scores(np.zeros((2, 4), dtype=np.float32), np.array([[0, 4]], dtype=np.int32))
-except Exception:
-    pass
-
-# Enable OpenCL GPU Hardware Acceleration (Intel Arc GPU / AMD / NVIDIA)
-try:
-    if cv2.ocl.haveOpenCL():
-        cv2.ocl.setUseOpenCL(True)
-        dev = cv2.ocl.Device.getDefault()
-        print(f"[MangaSearchEngine] OpenCL Hardware Acceleration ENABLED: {dev.name()}")
-    else:
-        print("[MangaSearchEngine] OpenCL not supported, running on optimized CPU multi-threading.")
-except Exception as e:
-    print(f"[MangaSearchEngine] OpenCL init info: {e}")
-
-import base64
-
-# Embedded 119-byte ONNX MatMul model (A: [M, 128], B: [128, N] -> C: [M, N])
-_MATMUL_ONNX_B64 = b"CA0SCW1hbmdhX2RtbDpiChEKAUEKAUISAUMiBk1hdE11bBIIZG1sX2dlbW1aFQoBQRIQCg4IARIKCgMSAU0KAwiAAVoVCgFCEhAKDggBEgoKAwiAAQoDEgFOYhUKAUMSEAoOCAESCgoDEgFNCgMSAU5CBAoAEBE="
-
-
-class DirectMLGemmRunner:
-    """DirectX 12 DirectML hardware acceleration runner for batch matrix multiplication."""
-
-    def __init__(self):
-        self._session = None
-        self._available = False
-        self._init_attempted = False
-        self._lock = threading.Lock()
-
-    def is_available(self) -> bool:
-        if not self._init_attempted:
-            self._initialize()
-        return self._available
-
-    def _initialize(self):
-        with self._lock:
-            if self._init_attempted:
-                return
-            self._init_attempted = True
-            try:
-                import onnxruntime as ort
-                if "DmlExecutionProvider" not in ort.get_available_providers():
-                    print("[DirectML] DmlExecutionProvider not found in ONNX Runtime.")
-                    self._available = False
-                    return
-
-                model_bytes = base64.b64decode(_MATMUL_ONNX_B64)
-                sess_opts = ort.SessionOptions()
-                sess_opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-                sess_opts.log_severity_level = 3  # Suppress verbose info logs
-                self._session = ort.InferenceSession(
-                    model_bytes,
-                    sess_options=sess_opts,
-                    providers=["DmlExecutionProvider", "CPUExecutionProvider"]
-                )
-                self._available = True
-                print(f"[DirectML] DirectML GPU Acceleration ENABLED: {self._session.get_providers()}")
-            except Exception as e:
-                print(f"[DirectML] Init info (falling back to CPU BLAS): {e}")
-                self._available = False
-                self._session = None
-
-    def run_gemm(self, A: np.ndarray, B: np.ndarray) -> np.ndarray:
-        """
-        Compute A @ B (where A is [M, 128], B is [128, N]).
-        Falls back to NumPy CPU BLAS if DirectML is unavailable or fails.
-        """
-        if not self._init_attempted:
-            self._initialize()
-        if self._session is not None and self._available:
-            try:
-                return self._session.run(["C"], {"A": A, "B": B})[0]
-            except Exception as e:
-                print(f"[DirectML] Run error (fallback to CPU BLAS): {e}")
-        return A @ B
-
-    def cleanup(self):
-        """Release session and force garbage collection to reclaim GPU shared memory immediately."""
-        with self._lock:
-            if self._session is not None:
-                self._session = None
-                self._init_attempted = False
-                self._available = False
-                import gc
-                gc.collect()
-
-
-dml_runner = DirectMLGemmRunner()
-
+from backend.ann_index import AnnIndex
 from backend.archive_handler import MangaArchive
+from backend.feature_store import FeatureStore, extract_sift, to_float
 
+QUERY_FEATURES = 1500          # per scale
+QUERY_SCALES = (1.0, 0.5)
+QUERY_MAX_DIM = 1000
+ANN_K = 10
+MIN_INLIERS = 8
 
-def compute_global_descriptor(descs: Optional[np.ndarray]) -> np.ndarray:
-    """
-    Compute a 128-dimensional normalized global descriptor from SIFT descriptors.
-    Uses mean pooling + L2 normalization for fast coarse filtering across thousands of pages in milliseconds.
-    """
-    if descs is None or len(descs) == 0:
-        return np.zeros(128, dtype=np.float32)
-    mean_vec = np.mean(descs, axis=0, dtype=np.float32)
-    norm = np.linalg.norm(mean_vec)
-    if norm > 1e-6:
-        return mean_vec / norm
-    return mean_vec
-
-
-from backend.archive_handler import MangaArchive
+ProgressFn = Callable[[float, str], None]
 
 
 def normalize_manga_photo(img: np.ndarray) -> np.ndarray:
@@ -235,39 +84,6 @@ def normalize_manga_photo(img: np.ndarray) -> np.ndarray:
 
     return stretched
 
-
-class BoundedMemoryCache:
-    """Thread-safe LRU in-memory feature cache with bounded capacity to prevent OOM."""
-
-    def __init__(self, max_entries: int = 500):
-        self.max_entries = max_entries
-        self._cache: OrderedDict[str, Any] = OrderedDict()
-        self._lock = threading.Lock()
-
-    def get(self, key: str) -> Optional[Any]:
-        with self._lock:
-            if key in self._cache:
-                self._cache.move_to_end(key)
-                return self._cache[key]
-            return None
-
-    def put(self, key: str, value: Any):
-        with self._lock:
-            if key in self._cache:
-                self._cache.move_to_end(key)
-                self._cache[key] = value
-            else:
-                self._cache[key] = value
-                if len(self._cache) > self.max_entries:
-                    self._cache.popitem(last=False)
-
-    def clear(self):
-        with self._lock:
-            self._cache.clear()
-
-    def __len__(self) -> int:
-        with self._lock:
-            return len(self._cache)
 
 
 def parse_manga_volume_and_page(archive_name: str, page_filename: str, page_number: int) -> Dict[str, Any]:
@@ -385,256 +201,178 @@ class SearchResult:
         }
 
 
+
+
 class MangaSearchEngine:
-    """Core matching engine utilizing SIFT, RANSAC, RAM caching, and parallel search."""
+    """Feature store + ANN index + geometric verification."""
 
-    def __init__(self, max_features: int = 2000, cache_dir: Optional[Path] = None):
-        self.max_features = max_features
-        self.cache_dir = cache_dir or Path(".cache_descriptors")
-        self.cache_dir.mkdir(parents=True, exist_ok=True)
+    def __init__(self, max_features: int = 2000, cache_dir: Optional[Path] = None,
+                 legacy_cache_dir: Optional[Path] = None):
+        self.cache_dir = Path(cache_dir or ".cache_index")
+        self.store = FeatureStore(self.cache_dir / "features", legacy_cache_dir=legacy_cache_dir)
+        self.ann = AnnIndex(self.cache_dir / "ann", self.store)
+        self._ann_loaded = False
+        self._index_lock = threading.Lock()
+        self.num_workers = max(1, min(8, os.cpu_count() or 4))
 
-        # In-Memory Bounded LRU Cache to eliminate repeated disk I/O while capping RAM usage
-        self._memory_cache = BoundedMemoryCache(max_entries=600)
-        self._cache_lock = threading.Lock()
+    # ---------- index management ----------
+    def load_index(self) -> None:
+        with self._index_lock:
+            if not self._ann_loaded:
+                self.ann.load()
+                self._ann_loaded = True
 
-        # Thread pool for parallel matching (matches CPU logical cores)
-        self.num_workers = max(1, os.cpu_count() or 4)
+    def is_indexed(self, archive: MangaArchive) -> bool:
+        return self.store.has(archive)
 
-        # Initialize SIFT
-        self.sift = cv2.SIFT_create(nfeatures=self.max_features)
+    def build_features(self, archive: MangaArchive, progress: Optional[Callable[[int, int], None]] = None) -> None:
+        self.store.ensure(archive, progress)
 
-        # FLANN matcher & GPU-accelerated BruteForce Matcher
-        FLANN_INDEX_KDTREE = 1
-        index_params = dict(algorithm=FLANN_INDEX_KDTREE, trees=5)
-        search_params = dict(checks=50)
-        self.flann = cv2.FlannBasedMatcher(index_params, search_params)
-        self.bf = cv2.BFMatcher(cv2.NORM_L2)
+    def sync_index(self, archives: List[MangaArchive], progress=None) -> bool:
+        """Make the ANN index match the library: add indexed archives, drop removed ones."""
+        self.load_index()
+        return self.ann.sync(archives, progress)
 
-    def extract_features(self, img: np.ndarray, max_dim: int = 1200) -> Tuple[np.ndarray, np.ndarray]:
-        """Extract SIFT keypoints and descriptors with optimal resolution and OpenCL GPU acceleration."""
-        if len(img.shape) == 3:
-            img_gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        else:
-            img_gray = img
+    def ensure_ready(self, archives: List[MangaArchive], progress: Optional[ProgressFn] = None) -> None:
+        """Build missing features and add them to the index (for searching un-indexed archives)."""
+        self.load_index()
+        todo = [a for a in archives if not self.store.has(a)]
+        for i, a in enumerate(todo):
+            def p(cur, tot, i=i, a=a):
+                if progress:
+                    progress(100.0 * (i + cur / max(1, tot)) / len(todo), f"インデックス作成中: {a.name} ({cur}/{tot})")
+            self.store.ensure(a, p)
+        # Only wait for the index writer when a search target is not in the index yet.
+        missing = [a for a in archives if self.store.folder(a).name not in self.ann.blocks]
+        if missing:
+            if progress:
+                progress(100.0, "検索インデックスを更新中…")
+            self.ann.add(missing)
 
-        h, w = img_gray.shape
-        scale = 1.0
-        if max(h, w) > max_dim:
-            scale = max_dim / max(h, w)
-            new_w, new_h = int(w * scale), int(h * scale)
-        else:
-            new_w, new_h = w, h
-
-        # GPU acceleration via OpenCL UMat if available
-        use_umat = cv2.ocl.useOpenCL()
-        kps = None
-        descs = None
-
-        if use_umat:
-            try:
-                u_img = cv2.UMat(img_gray)
-                if scale != 1.0:
-                    u_img = cv2.resize(u_img, (new_w, new_h), interpolation=cv2.INTER_AREA)
-                kps, u_descs = self.sift.detectAndCompute(u_img, None)
-                if u_descs is not None:
-                    descs = u_descs.get() if hasattr(u_descs, "get") else u_descs
-            except Exception:
-                use_umat = False
-
-        if not use_umat or kps is None:
-            if scale != 1.0:
-                img_proc = cv2.resize(img_gray, (new_w, new_h), interpolation=cv2.INTER_AREA)
-            else:
-                img_proc = img_gray
-            kps, descs = self.sift.detectAndCompute(img_proc, None)
-
-        if kps is None or len(kps) == 0:
-            return np.empty((0, 2), dtype=np.float32), np.empty((0, 128), dtype=np.float32)
-
-        pts = np.array([kp.pt for kp in kps], dtype=np.float32)
-        if scale != 1.0:
-            pts /= scale
-
+    # ---------- query ----------
+    def _query_features(self, query_img: np.ndarray, normalize_photo: bool) -> Tuple[np.ndarray, np.ndarray]:
+        gray = query_img if query_img.ndim == 2 else cv2.cvtColor(query_img, cv2.COLOR_BGR2GRAY)
+        candidates = [normalize_manga_photo(query_img), gray] if normalize_photo else [gray]
+        pts = np.zeros((0, 2), np.float32)
+        descs = np.zeros((0, 128), np.float32)
+        for img in candidates:
+            ps, ds = [], []
+            for s in QUERY_SCALES:
+                p, d = extract_sift(img, QUERY_FEATURES, max_dim=int(QUERY_MAX_DIM * s), scale=s)
+                ps.append(p)
+                ds.append(d)
+            pts, descs = np.concatenate(ps), np.concatenate(ds).astype(np.float32)
+            if len(pts) >= MIN_INLIERS:
+                break
         return pts, descs
 
-    def get_cache_key(self, archive_name: str, page_index: int) -> str:
-        return f"{archive_name}_{page_index}"
+    def _vote(self, qd: np.ndarray, targets: Dict[str, MangaArchive], n_candidates: int, nprobe: int):
+        D, blk, row, keys = self.ann.query(qd, ANN_K, nprobe)
 
-    def get_cache_path(self, archive: MangaArchive, page_index: int) -> Path:
-        safe_name = "".join(c if c.isalnum() else "_" for c in f"{archive.name}_{page_index}")
-        return self.cache_dir / f"{safe_name}.pkl"
+        # page index (within its archive) of every hit; -1 when not a search target
+        page = np.full(blk.shape, -1, np.int64)
+        offsets = {}
+        for bi in np.unique(blk[blk >= 0]):
+            arc = targets.get(keys[bi])
+            if arc is None:
+                continue
+            offs = self.store.get(arc).offsets
+            offsets[int(bi)] = offs
+            m = blk == bi
+            page[m] = np.searchsorted(offs, row[m], side="right") - 1
 
-    def get_or_compute_page_features(
-        self, archive: MangaArchive, page_index: int
-    ) -> Tuple[np.ndarray, Optional[np.ndarray], Tuple[int, int]]:
-        """Retrieve features from in-memory RAM cache, disk cache, or compute fresh."""
-        cache_key = self.get_cache_key(archive.name, page_index)
+        # Lowe-style weight: how clearly a hit beats the k-th neighbour (local background)
+        d2 = np.maximum(0.0, 2.0 - 2.0 * D)
+        w = np.maximum(0.0, 1.0 - d2 / (0.8 * d2[:, -1:] + 1e-6))
+        gid = np.where(page >= 0, blk * 1_000_000 + page, -1)
+        m_all = (gid[:, :-1] >= 0) & (w[:, :-1] > 0)
+        # each query descriptor votes at most once per page
+        for c in range(1, ANN_K - 1):
+            m_all[:, c] &= ~np.any(gid[:, :c] == gid[:, c:c + 1], axis=1)
+        g = gid[:, :-1][m_all]
+        if len(g) == 0:
+            return []
+        uniq, inv = np.unique(g, return_inverse=True)
+        votes = np.bincount(inv, weights=w[:, :-1][m_all])
+        b_of, p_of = uniq // 1_000_000, uniq % 1_000_000
+        cnt = np.array([offsets[int(b)][p + 1] - offsets[int(b)][p] for b, p in zip(b_of, p_of)], np.float64)
+        score = votes / np.sqrt(cnt + 1.0)
+        top = np.argsort(-score)[:n_candidates]
+        return [(targets[keys[b_of[i]]], int(p_of[i])) for i in top]
 
-        # 1. Fast path: In-Memory Bounded LRU Cache (nanosecond lookup, zero disk I/O)
-        cached = self._memory_cache.get(cache_key)
-        if cached is not None:
-            return cached
-
-        # 2. Disk Cache
-        cache_path = self.get_cache_path(archive, page_index)
-        if cache_path.exists():
-            try:
-                with open(cache_path, "rb") as f:
-                    data = pickle.load(f)
-                    descs = data.get("descs")
-                    if descs is not None and len(descs) > 0:
-                        norms = np.linalg.norm(descs, axis=1, keepdims=True) + 1e-7
-                        p_norm = (descs / norms).astype(np.float32)
-                    else:
-                        p_norm = None
-                    entry = (data["pts"], p_norm, data["shape"])
-                    self._memory_cache.put(cache_key, entry)
-                    return entry
-            except Exception:
-                pass
-
-        # 3. Compute from scratch
-        img_gray = archive.get_page_cv(page_index, grayscale=True)
-        h, w = img_gray.shape[:2]
-        pts, descs = self.extract_features(img_gray, max_dim=1400)
-
-        # Save to disk
-        try:
-            with open(cache_path, "wb") as f:
-                pickle.dump({
-                    "pts": pts,
-                    "descs": descs,
-                    "shape": (w, h),
-                }, f, protocol=pickle.HIGHEST_PROTOCOL)
-        except Exception:
-            pass
-
-        if descs is not None and len(descs) > 0:
-            norms = np.linalg.norm(descs, axis=1, keepdims=True) + 1e-7
-            p_norm = (descs / norms).astype(np.float32)
-        else:
-            p_norm = None
-
-        entry = (pts, p_norm, (w, h))
-        self._memory_cache.put(cache_key, entry)
-        return entry
-
-    def match_query_to_page(
-        self,
-        query_pts: np.ndarray,
-        query_descs: np.ndarray,
-        query_shape: Tuple[int, int],
-        page_pts: np.ndarray,
-        page_descs: Optional[np.ndarray],
-        page_shape: Tuple[int, int],
-        ratio_threshold: float = 0.75,
-        min_panel_area_percent: float = 2.0,
-    ) -> Optional[SearchResult]:
-        """
-        Precise SIFT + RANSAC geometric verification.
-        Includes Spatial Dispersion check and minimum panel size filtering.
-        """
-        if query_descs is None or page_descs is None:
+    def _verify(self, qk, qd, qshape, archive: MangaArchive, page_idx: int,
+                min_panel_area_percent: float) -> Optional["SearchResult"]:
+        pk, pd_u8, (pw, ph) = self.store.get(archive).page(page_idx)
+        if len(pd_u8) < MIN_INLIERS:
             return None
-        if len(query_descs) < 8 or len(page_descs) < 8:
+        pd = to_float(pd_u8)
+        sim = qd @ pd.T
+        idx = np.argpartition(-sim, 1, axis=1)[:, :2]
+        s2 = np.take_along_axis(sim, idx, axis=1)
+        order = np.argsort(-s2, axis=1)
+        idx = np.take_along_axis(idx, order, axis=1)
+        s2 = np.take_along_axis(s2, order, axis=1)
+        d1 = np.maximum(0.0, 2.0 - 2.0 * s2[:, 0])
+        d2 = np.maximum(0.0, 2.0 - 2.0 * s2[:, 1])
+        good = np.where(d1 < 0.64 * d2)[0]          # Lowe ratio test 0.8
+        if len(good) < MIN_INLIERS:
+            return None
+        # one-to-one: keep only the strongest query match for each page keypoint
+        by_strength = good[np.argsort(-s2[good, 0])]
+        _, first = np.unique(idx[by_strength, 0], return_index=True)
+        sel = by_strength[first]
+        if len(sel) < MIN_INLIERS:
             return None
 
-        # Ensure consistent L2 normalization between query and page descriptors for Euclidean distance
-        q_norm = query_descs.astype(np.float32)
-        q_norm /= (np.linalg.norm(q_norm, axis=1, keepdims=True) + 1e-7)
-
-        p_norm = page_descs.astype(np.float32)
-        p_norm /= (np.linalg.norm(p_norm, axis=1, keepdims=True) + 1e-7)
-
-        # KNN Match
-        try:
-            matches = self.flann.knnMatch(q_norm, p_norm, k=2)
-        except Exception:
-            matches = self.bf.knnMatch(q_norm, p_norm, k=2)
-
-        good_matches = []
-        for m_pair in matches:
-            if len(m_pair) == 2:
-                m, n = m_pair
-                if m.distance < ratio_threshold * n.distance:
-                    good_matches.append(m)
-
-        # Early Rejection 1: Ratio count threshold
-        if len(good_matches) < 8:
+        src = qk[sel].astype(np.float32)
+        dst = pk[idx[sel, 0]].astype(np.float32)
+        thr = float(np.clip(0.005 * max(pw, ph), 4.0, 12.0))
+        # Similarity transform (scale + rotation + shift): robust even with few inliers.
+        A, mask = cv2.estimateAffinePartial2D(src, dst, method=cv2.RANSAC, ransacReprojThreshold=thr,
+                                              maxIters=2000, confidence=0.995)
+        if A is None or mask is None:
+            return None
+        inl = mask.ravel().astype(bool)
+        n_inl = int(inl.sum())
+        scale = float(np.sqrt(abs(np.linalg.det(A[:2, :2]))))
+        if n_inl < MIN_INLIERS or not (0.03 < scale < 30.0):
             return None
 
-        # Approach A Early Rejection 2: Spatial dispersion on query side
-        # True panels have features spread across the query; a single tiny dot cluster is noise.
-        matched_q_pts = np.float32([query_pts[m.queryIdx] for m in good_matches])
-        q_min_x, q_max_x = np.min(matched_q_pts[:, 0]), np.max(matched_q_pts[:, 0])
-        q_min_y, q_max_y = np.min(matched_q_pts[:, 1]), np.max(matched_q_pts[:, 1])
-        q_span_w = q_max_x - q_min_x
-        q_span_h = q_max_y - q_min_y
-        qw, qh = query_shape
+        qw, qh = qshape
+        corners = np.float32([[0, 0], [qw, 0], [qw, qh], [0, qh]])
+        poly = corners @ A[:, :2].T + A[:, 2]
+        # A homography refit on the inliers follows perspective (phone photos) when it is sane.
+        if n_inl >= 12:
+            H, _ = cv2.findHomography(src[inl], dst[inl], cv2.USAC_MAGSAC, thr)
+            if H is not None:
+                hp = cv2.perspectiveTransform(corners.reshape(-1, 1, 2), H).reshape(-1, 2)
+                area_a = cv2.contourArea(poly.astype(np.float32))
+                area_h = cv2.contourArea(hp.astype(np.float32))
+                if cv2.isContourConvex(hp.astype(np.float32)) and area_a > 0 and 0.6 < area_h / area_a < 1.6:
+                    poly = hp
 
-        # If matching points are concentrated in a microscopic spot (< 5% span), reject before RANSAC
-        if q_span_w < qw * 0.05 or q_span_h < qh * 0.05:
+        xs, ys = poly[:, 0], poly[:, 1]
+        min_x, max_x = max(0, int(xs.min())), min(pw, int(xs.max()))
+        min_y, max_y = max(0, int(ys.min())), min(ph, int(ys.max()))
+        bw, bh = max_x - min_x, max_y - min_y
+        if bw <= 10 or bh <= 10:
             return None
-
-        src_pts = matched_q_pts.reshape(-1, 1, 2)
-        dst_pts = np.float32([page_pts[m.trainIdx] for m in good_matches]).reshape(-1, 1, 2)
-
-        H, mask = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, 6.0)
-        if H is None or mask is None:
-            return None
-
-        inliers = mask.ravel().tolist()
-        inliers_count = int(sum(inliers))
-
-        if inliers_count < 8:
-            return None
-
-        pw, ph = page_shape
-        query_corners = np.float32([[0, 0], [qw, 0], [qw, qh], [0, qh]]).reshape(-1, 1, 2)
-
-        try:
-            projected_corners = cv2.perspectiveTransform(query_corners, H)
-        except Exception:
-            return None
-
-        poly = projected_corners.reshape(-1, 2).astype(int).tolist()
-        xs = [p[0] for p in poly]
-        ys = [p[1] for p in poly]
-        min_x = max(0, min(xs))
-        max_x = min(pw, max(xs))
-        min_y = max(0, min(ys))
-        max_y = min(ph, max(ys))
-
-        bbox_w = max_x - min_x
-        bbox_h = max_y - min_y
-
-        if bbox_w <= 10 or bbox_h <= 10:
-            return None
-
-        # Slider 2 Check: Minimum Panel Size Ratio
-        page_area = max(1, pw * ph)
-        bbox_area = bbox_w * bbox_h
-        area_percent = (bbox_area / page_area) * 100.0
-
+        area_percent = 100.0 * bw * bh / max(1, pw * ph)
         if area_percent < min_panel_area_percent:
-            # Drop matches that are smaller than the user-configured minimum panel size threshold
             return None
 
-        # Robust score computation rewarding both inlier count, inlier ratio, and healthy panel area
-        inlier_ratio = inliers_count / len(good_matches)
-        size_factor = min(1.0, area_percent / 4.0)
-        score = min(1.0, (inliers_count / 30.0) * 0.55 + inlier_ratio * 0.30 + size_factor * 0.15)
-
+        ratio = n_inl / len(sel)
+        score = min(1.0, 0.65 * min(1.0, n_inl / 40.0) + 0.35 * ratio)
         return SearchResult(
-            archive_name="",
-            archive_path="",
-            page_index=0,
-            page_filename="",
+            archive_name=archive.name,
+            archive_path=str(archive.path),
+            page_index=page_idx,
+            page_filename=archive.pages[page_idx],
             score=score,
-            inliers_count=inliers_count,
-            total_matches=len(good_matches),
-            bounding_box={"x": int(min_x), "y": int(min_y), "w": int(bbox_w), "h": int(bbox_h)},
-            polygon=poly,
+            inliers_count=n_inl,
+            total_matches=len(sel),
+            bounding_box={"x": min_x, "y": min_y, "w": bw, "h": bh},
+            polygon=poly.astype(int).tolist(),
         )
 
     def search_query(
@@ -644,250 +382,61 @@ class MangaSearchEngine:
         top_k: int = 5,
         min_score: float = 0.20,
         normalize_photo: bool = True,
-        min_panel_area_percent: float = 1.0,  # Slider: Minimum panel size % of page area
-        use_gpu_dml: bool = False,
-        enable_coarse_clip: bool = True,  # Stride-2 spatial subsampling in Stage 1 for fast coarse ranking
-        progress_callback: Optional[Callable[[int, int], None]] = None,
-    ) -> List[SearchResult]:
-        """
-        High-Performance Manga Panel Search Engine with BLAS / DirectML GEMM & Real-Time Progress:
-        - Exhaustive coverage across all registered pages with high selectivity.
-        - Hardware Acceleration: Intel oneMKL CPU BLAS or DirectX 12 DirectML (Intel Arc GPU XMX).
-        - 2-Stage Coarse-to-Fine Architecture with Lowe's Distinctive / Margin Scoring + Fine RANSAC.
-        - Stride-2 Spatial Subsampling in Stage 1: Halves FLOPs while preserving multi-scale feature coverage.
-        - Fine-grained progress callback with smooth frontend animation interpolation.
-        """
-        qh, qw = query_img.shape[:2]
-
-        # 1. Feature extraction with optimal resolution (Approach A)
-        if normalize_photo:
-            processed_img = normalize_manga_photo(query_img)
-            query_pts, query_descs = self.extract_features(processed_img, max_dim=1000)
-            if len(query_pts) < 8 or query_descs is None:
-                query_pts, query_descs = self.extract_features(query_img, max_dim=1000)
-        else:
-            query_pts, query_descs = self.extract_features(query_img, max_dim=1000)
-
-        if len(query_pts) < 8 or query_descs is None:
-            return []
-
-        # L2-normalize query descriptors for fast BLAS cosine distance
-        q_norms = np.linalg.norm(query_descs, axis=1, keepdims=True) + 1e-7
-        q_norm = (query_descs / q_norms).astype(np.float32)
-
-        # In fast mode, subsample query features evenly to 500 points to slash GEMM FLOPs
-        # while keeping 100% full page descriptors intact for maximum selectivity
-        if enable_coarse_clip and len(q_norm) > 500:
-            step = len(q_norm) / 500.0
-            q_indices = [int(i * step) for i in range(500)]
-            qn_stage1 = q_norm[q_indices]
-        else:
-            qn_stage1 = q_norm
-
-        # 2. Build list of all targets across archives (100% exhaustive coverage)
-        if hasattr(archives, "archives"):
-            target_archives = archives.archives
-        else:
-            target_archives = archives
-
-        all_targets: List[Tuple[MangaArchive, int]] = []
-        for archive in target_archives:
-            for page_idx in range(len(archive)):
-                all_targets.append((archive, page_idx))
-
-        total_targets = len(all_targets)
-        if total_targets == 0:
-            return []
-
-        if progress_callback:
-            progress_callback(0, total_targets)
-
-        # 3. Two-Stage Coarse-to-Fine Search Architecture
-        # Stage 1: Ultra-fast GEMM + Parallel Numba JIT Lowe's Scoring (0% - 90% progress)
-        # Stage 2: Fine Geometric Verification (RANSAC) on top candidates only (90% - 100% progress)
-        TOP_K_CANDIDATES = 100
-        candidate_heap: List[Tuple[float, int]] = []  # Min-heap of (coarse_score, target_idx)
-        batch_size = 250
-        processed_count = 0
-
-        for b_start in range(0, total_targets, batch_size):
-            batch_items = all_targets[b_start : b_start + batch_size]
-            batch_descs = []
-            batch_meta = []
-            target_indices = []
-            start_col = 0
-
-            for offset, (arc, page_idx) in enumerate(batch_items):
-                target_idx = b_start + offset
-                try:
-                    pts, p_norm, (pw, ph) = self.get_or_compute_page_features(arc, page_idx)
-                    if p_norm is not None and len(pts) >= 8:
-                        batch_descs.append(p_norm)
-                        sz = len(p_norm)
-                        batch_meta.append([start_col, sz])
-                        target_indices.append(target_idx)
-                        start_col += sz
-                except Exception:
-                    pass
-
-                # Emit fine-grained progress during feature reading (every 50 pages)
-                if progress_callback and (offset + 1) % 50 == 0:
-                    curr = b_start + offset + 1
-                    progress_callback(int(curr * 0.90), total_targets)
-
-            if batch_descs:
-                # Batch matrix multiplication across all pages in batch
-                P_concat = np.vstack(batch_descs)
-                if use_gpu_dml and dml_runner.is_available():
-                    sim_concat = dml_runner.run_gemm(qn_stage1, P_concat.T)
-                else:
-                    sim_concat = qn_stage1 @ P_concat.T
-
-                # Ultra-fast parallel Numba JIT Lowe's Distinctive / Margin scoring
-                # Eliminates background noise accumulation with zero Python overhead
-                meta_arr = np.array(batch_meta, dtype=np.int32)
-                batch_scores = _batch_compute_lowe_scores(sim_concat, meta_arr)
-
-                for score_val, curr_idx in zip(batch_scores, target_indices):
-                    sc = float(score_val)
-                    if len(candidate_heap) < TOP_K_CANDIDATES:
-                        heapq.heappush(candidate_heap, (sc, curr_idx))
-                    else:
-                        if sc > candidate_heap[0][0]:
-                            heapq.heapreplace(candidate_heap, (sc, curr_idx))
-
-                # Immediately discard large batch matrices to free RAM
-                del P_concat, sim_concat, batch_descs, batch_meta
-
-            processed_count += len(batch_items)
+        min_panel_area_percent: float = 1.0,
+        use_gpu_dml: bool = False,          # kept for API compatibility; no longer used
+        enable_coarse_clip: bool = True,    # fast mode: fewer probes and candidates
+        progress_callback: Optional[ProgressFn] = None,
+    ) -> List["SearchResult"]:
+        def progress(pct: float, stage: str) -> None:
             if progress_callback:
-                # Scale Stage 1 to 0% - 90%
-                progress_callback(int(processed_count * 0.90), total_targets)
+                progress_callback(pct, stage)
 
-        # Stage 2: Fine Geometric Verification (RANSAC & Homography) on Top Candidates
-        sorted_candidates = sorted(candidate_heap, key=lambda x: x[0], reverse=True)
+        archives = list(getattr(archives, "archives", archives))
+        if not archives:
+            return []
+        self.ensure_ready(archives, lambda p, s: progress(p * 0.5, s))
+
+        progress(55, "入力画像の特徴を抽出中…")
+        qh, qw = query_img.shape[:2]
+        qk, qd = self._query_features(query_img, normalize_photo)
+        if len(qk) < MIN_INLIERS:
+            return []
+
+        progress(65, "候補ページを絞り込み中…")
+        targets = {self.store.folder(a).name: a for a in archives}
+        n_cand = 40 if enable_coarse_clip else 100
+        nprobe = 8 if enable_coarse_clip else 32
+        candidates = self._vote(qd, targets, n_cand, nprobe)
+
+        stage = f"上位 {len(candidates)} ページでコマの位置を照合中…"
+        progress(75, stage)
         results: List[SearchResult] = []
-        num_candidates = len(sorted_candidates)
+        done = [0]
+        lock = threading.Lock()
 
-        for c_idx, (score_val, target_idx) in enumerate(sorted_candidates):
-            arc, page_idx = all_targets[target_idx]
+        def work(c):
+            arc, p = c
             try:
-                pts, p_norm, (pw, ph) = self.get_or_compute_page_features(arc, page_idx)
-                if p_norm is None or len(pts) < 8:
-                    continue
+                r = self._verify(qk, qd, (qw, qh), arc, p, min_panel_area_percent)
+            except Exception as e:
+                print(f"[MangaSearchEngine] verify {arc.name} p{p}: {e}")
+                r = None
+            with lock:
+                done[0] += 1
+                progress(75 + 25 * done[0] / max(1, len(candidates)), stage)
+            return r
 
-                sim = q_norm @ p_norm.T
+        with ThreadPoolExecutor(self.num_workers) as ex:
+            for r in ex.map(work, candidates):
+                if r is not None and r.score >= min_score:
+                    results.append(r)
 
-                # Exact Top-2 partition for Lowe's ratio test
-                idx = np.argpartition(sim, -2, axis=1)[:, -2:]
-                val1 = np.take_along_axis(sim, idx[:, 1:], axis=1).squeeze(1)
-                val2 = np.take_along_axis(sim, idx[:, :1], axis=1).squeeze(1)
-
-                d1_sq = np.maximum(0.0, 2.0 - 2.0 * val1)
-                d2_sq = np.maximum(0.0, 2.0 - 2.0 * val2)
-                ratio_mask = d1_sq < 0.5625 * d2_sq  # 0.75^2
-                good_count = int(np.count_nonzero(ratio_mask))
-                if good_count < 8:
-                    continue
-
-                matched_q_indices = np.where(ratio_mask)[0]
-                matched_p_indices = idx[:, 1:][ratio_mask].ravel()
-
-                # Bijective 1-to-1 constraint: for each target feature, keep only the single best query match
-                # Eliminates tone/hatch false positive clusters where hundreds of query points collapse into a few target points.
-                best_match_for_target = {}
-                for q_i, t_i in zip(matched_q_indices, matched_p_indices):
-                    s_val = sim[q_i, t_i]
-                    if t_i not in best_match_for_target or s_val > best_match_for_target[t_i][0]:
-                        best_match_for_target[t_i] = (s_val, q_i)
-
-                if len(best_match_for_target) < 8:
-                    continue
-
-                unique_t_indices = list(best_match_for_target.keys())
-                unique_q_indices = [best_match_for_target[t][1] for t in unique_t_indices]
-
-                matched_q_pts = query_pts[unique_q_indices]
-                matched_p_pts = pts[unique_t_indices]
-
-                # Spatial dispersion check on query side
-                q_min_x, q_max_x = np.min(matched_q_pts[:, 0]), np.max(matched_q_pts[:, 0])
-                q_min_y, q_max_y = np.min(matched_q_pts[:, 1]), np.max(matched_q_pts[:, 1])
-                if (q_max_x - q_min_x < qw * 0.05) or (q_max_y - q_min_y < qh * 0.05):
-                    continue
-
-                src_pts = matched_q_pts.reshape(-1, 1, 2)
-                dst_pts = matched_p_pts.reshape(-1, 1, 2)
-                H, mask = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, 6.0)
-                if H is None or mask is None:
-                    continue
-
-                inliers_count = int(np.sum(mask.ravel().astype(np.int32)))
-                if inliers_count < 8:
-                    continue
-
-                # Project query corners
-                query_corners = np.float32([[0, 0], [qw, 0], [qw, qh], [0, qh]]).reshape(-1, 1, 2)
-                try:
-                    projected_corners = cv2.perspectiveTransform(query_corners, H)
-                except Exception:
-                    continue
-
-                poly_pts = projected_corners.reshape(-1, 2)
-                poly = poly_pts.astype(int).tolist()
-                xs = [p[0] for p in poly]
-                ys = [p[1] for p in poly]
-                min_x = max(0, min(xs))
-                max_x = min(pw, max(xs))
-                min_y = max(0, min(ys))
-                max_y = min(ph, max(ys))
-
-                bbox_w = max_x - min_x
-                bbox_h = max_y - min_y
-                if bbox_w <= 10 or bbox_h <= 10:
-                    continue
-
-                # Slider Check: Minimum Panel Size Ratio
-                page_area = max(1, pw * ph)
-                bbox_area = bbox_w * bbox_h
-                area_percent = (bbox_area / page_area) * 100.0
-                if area_percent < min_panel_area_percent:
-                    continue
-
-                # Robust score computation rewarding inlier count, inlier ratio, and panel area
-                inlier_ratio = inliers_count / max(1, good_count)
-                size_factor = min(1.0, area_percent / 4.0)
-                score = min(1.0, (inliers_count / 30.0) * 0.55 + inlier_ratio * 0.30 + size_factor * 0.15)
-
-                if score >= min_score:
-                    results.append(SearchResult(
-                        archive_name=arc.name,
-                        archive_path=str(arc.path),
-                        page_index=page_idx,
-                        page_filename=arc.pages[page_idx],
-                        score=score,
-                        inliers_count=inliers_count,
-                        total_matches=good_count,
-                        bounding_box={"x": int(min_x), "y": int(min_y), "w": int(bbox_w), "h": int(bbox_h)},
-                        polygon=poly,
-                    ))
-            except Exception:
-                pass
-
-            if progress_callback and num_candidates > 0:
-                stage2_progress = int(total_targets * 0.90 + ((c_idx + 1) / num_candidates) * (total_targets * 0.10))
-                progress_callback(min(total_targets, stage2_progress), total_targets)
-
-        if progress_callback:
-            progress_callback(total_targets, total_targets)
-
-        # Release GPU shared memory immediately if DirectML was mobilized
-        if use_gpu_dml:
-            dml_runner.cleanup()
-
-        # Run garbage collection to return discarded feature matrices to OS
+        progress(100, "完了")
         gc.collect()
-
-        # Sort descending by score & inliers
         results.sort(key=lambda r: (r.score, r.inliers_count), reverse=True)
+        # With a confident winner, drop weak look-alikes (typeset text and screentones match
+        # many pages a little). Reused panels on other pages score close to the winner and stay.
+        if results and results[0].score >= 0.5:
+            floor = 0.25 * results[0].inliers_count
+            results = [r for r in results if r.inliers_count >= floor]
         return results[:top_k]

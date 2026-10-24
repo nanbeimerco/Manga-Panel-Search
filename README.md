@@ -2,7 +2,7 @@
 
 漫画の1コマやスマートフォンの撮影写真、切り抜き画像から、ライブラリ内の全巻・全ページを照合し、該当する「作品名・巻数・ページ番号・コマの正確な位置」を特定するデスクトップアプリケーションです。
 
-Google Material Design 3 (M3) に準拠したUIと、コンピュータビジョン技術（SIFT特徴量照合・幾何学的ホモグラフィ検証・DirectML GPU加速）を融合し、高速かつ信頼性の高い特定を実現しています。
+Microsoft Fluent 2 デザインシステムに準拠したUIと、コンピュータビジョン技術（RootSIFT特徴量・faiss近似最近傍検索・RANSAC幾何検証）を組み合わせ、数千ページのライブラリからでも数秒で特定します。
 
 ---
 
@@ -19,11 +19,11 @@ Google Material Design 3 (M3) に準拠したUIと、コンピュータビジョ
 - **対象作品の絞り込み**: 検索対象を限定することで、探索を効率化し、より高速かつ的確な特定が可能。
 - **開閉状態の自動保存**: 作品ごとの展開・折りたたみ状態を記憶。
 
-### 3. 高速検索パイプライン & GPU 加速
+### 3. 高速検索パイプライン
 - **2段階ハイブリッドパイプライン**:
-  - **Stage 1 (粗探索)**: 空間ストライドサンプリングによる候補ページの高速絞り込み。
-  - **Stage 2 (精密幾何検証)**: RANSAC ホモグラフィ変換による確信度スコアリングと正確なコマ枠バウンディングボックスの描画。
-- **DirectX 12 / DirectML GPU 加速**: ONNX Runtime (DirectML) を活用し、Intel Arc / NVIDIA / AMD GPU での行列積計算を高速化。
+  - **Stage 1 (候補の絞り込み)**: クエリの各特徴点がライブラリ全体の faiss 索引 (IVF-PQ) から近い特徴点を探し、ページごとに投票。数千ページを1秒未満で数十ページに絞り込みます。
+  - **Stage 2 (精密幾何検証)**: 上位候補だけを厳密に照合し、相似変換 RANSAC とホモグラフィでコマの位置を特定します（並列処理）。
+- **巻ごとの特徴量ストア**: 特徴量を巻単位の uint8 配列で保存（旧形式の約1/4）。旧キャッシュは初回起動時に自動で変換されます。
 
 ---
 
@@ -32,7 +32,7 @@ Google Material Design 3 (M3) に準拠したUIと、コンピュータビジョ
 最も簡単な方法は、ビルド済みインストーラーを使用することです。Python や Node.js のインストールは不要です。
 
 1. [GitHub Releases](https://github.com/nanbeimerco/Manga-Panel-Search/releases) ページにアクセスします。
-2. 最新リリースの `Manga Panel Search Setup 1.0.9.exe` をダウンロードします。
+2. 最新リリースの `Manga Panel Search Setup 1.1.0.exe` をダウンロードします。
 3. ダウンロードしたインストーラーを実行し、画面の指示に従ってインストールを完了してください。
 4. デスクトップまたはスタートメニューのショートカットからアプリを起動できます。
 
@@ -43,7 +43,7 @@ Google Material Design 3 (M3) に準拠したUIと、コンピュータビジョ
 1. **漫画データの登録**:
    - アプリを起動し、「登録ライブラリ」タブを開きます。
    - お手持ちの漫画アーカイブ（`.zip`, `.cbz`）または画像が入ったフォルダをドラッグ＆ドロップします。
-   - バックグラウンドで特徴量インデックス（`.cache_descriptors`）が作成されます。
+   - バックグラウンドで特徴量インデックス（`%APPDATA%\MangaPanelSearch\index_v2`）が作成されます。
 2. **検索対象の設定**:
    - フォルダ単位または巻単位のチェックボックスで、検索対象に含めたい作品を選択します。
 3. **コマ画像の検索**:
@@ -100,7 +100,7 @@ pyinstaller manga_backend.spec
 # 静的ファイルの同期後、インストーラーを生成
 npm run dist
 ```
-`release_installer/` 配下に `Manga Panel Search Setup 1.0.8.exe` が生成されます。
+`release_installer/` 配下に `Manga Panel Search Setup 1.1.0.exe` が生成されます。
 
 ---
 
@@ -109,10 +109,10 @@ npm run dist
 | レイヤー | 技術 / ライブラリ | 用途 |
 | :--- | :--- | :--- |
 | **GUI Framework** | Electron (v33) | クロスプラットフォーム デスクトップシェル |
-| **Frontend** | HTML5, CSS3, Vanilla JS, Material Design 3 | レスポンシブなモダン UI |
+| **Frontend** | HTML5, CSS3, Vanilla JS, Fluent 2 (Fluent System Icons 同梱) | Windows 11 になじむ UI、外部フォント不要 |
 | **Backend** | Python 3.12, FastAPI, Uvicorn | RESTful API & 画像処理エンジン |
-| **Computer Vision** | OpenCV (cv2), Pillow | SIFT特徴抽出、FLANN、RANSAC幾何検証 |
-| **Acceleration** | Numba JIT, ONNX Runtime (DirectML) | CPU/GPU 高速行列演算 & 幾何的一貫性照合 |
+| **Computer Vision** | OpenCV (cv2), Pillow | RootSIFT特徴抽出、RANSAC幾何検証 |
+| **Search Index** | faiss (IVF-PQ) | ライブラリ全体の近似最近傍検索 |
 | **Packaging** | PyInstaller, electron-builder, NSIS | スタンドアロン実行可能ファイルの生成 |
 
 ---

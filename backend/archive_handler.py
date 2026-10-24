@@ -178,6 +178,42 @@ class MangaArchive:
 
         raise ValueError(f"Unsupported archive type {self.archive_type}")
 
+    def iter_page_bytes(self):
+        """
+        Yield (page_index, bytes) for every page, opening the archive only once.
+        RAR/7z are extracted in one pass with the external tool, which is far faster
+        than spawning it once per page.
+        """
+        pages = self.pages
+        if self.archive_type == "zip":
+            with zipfile.ZipFile(self.path, "r") as zf:
+                for i, name in enumerate(pages):
+                    yield i, zf.read(name)
+            return
+        if self.archive_type == "tar":
+            with tarfile.open(self.path, "r:*") as tf:
+                for i, name in enumerate(pages):
+                    f = tf.extractfile(name)
+                    yield i, f.read() if f else b""
+            return
+        tool = getattr(rarfile, "UNRAR_TOOL", None) if HAS_RAR else None
+        if self.archive_type in ("rar", "7z") and tool and Path(tool).name.lower().startswith("7z"):
+            import subprocess
+            import tempfile
+            with tempfile.TemporaryDirectory() as td:
+                flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+                subprocess.run([tool, "x", "-y", "-bso0", "-bsp0", f"-o{td}", str(self.path)],
+                               check=True, creationflags=flags, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                for i, name in enumerate(pages):
+                    p = Path(td) / name
+                    if p.exists():
+                        yield i, p.read_bytes()
+                    else:
+                        yield i, self.get_page_bytes(i)
+            return
+        for i in range(len(pages)):
+            yield i, self.get_page_bytes(i)
+
     def get_page_image(self, page_index: int) -> Image.Image:
         """Extract page as PIL Image."""
         b = self.get_page_bytes(page_index)

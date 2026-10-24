@@ -21,10 +21,12 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.mangapanel.search.data.api.MangaApiClient
 import com.mangapanel.search.data.engine.LocalSearchEngine
+import com.mangapanel.search.data.local.LibraryGroupManager
 import com.mangapanel.search.data.local.LocalArchiveManager
 import com.mangapanel.search.ui.screens.LibraryScreen
 import com.mangapanel.search.ui.screens.SearchScreen
 import com.mangapanel.search.ui.screens.SettingsScreen
+import com.mangapanel.search.ui.theme.AppThemeMode
 import com.mangapanel.search.ui.theme.ColorPresets
 import com.mangapanel.search.ui.theme.MangaPanelSearchTheme
 
@@ -40,16 +42,26 @@ class MainActivity : ComponentActivity() {
             val savedThemeId = remember { prefs.getString("theme_preset", ColorPresets.TITANIUM_SLATE.id) ?: ColorPresets.TITANIUM_SLATE.id }
             var currentPreset by remember { mutableStateOf(ColorPresets.fromId(savedThemeId)) }
 
+            val savedThemeModeId = remember { prefs.getString("theme_mode", AppThemeMode.SYSTEM.id) ?: AppThemeMode.SYSTEM.id }
+            var currentThemeMode by remember { mutableStateOf(AppThemeMode.fromId(savedThemeModeId)) }
+
+            var useDynamicColor by remember { mutableStateOf(prefs.getBoolean("use_dynamic_color", false)) }
+
             val savedServerUrl = remember { prefs.getString("server_url", "http://10.0.2.2:8088") ?: "http://10.0.2.2:8088" }
             val apiClient = remember { MangaApiClient(baseUrl = savedServerUrl) }
 
             var isLocalMode by remember { mutableStateOf(prefs.getBoolean("is_local_mode", true)) }
             val localArchiveManager = remember { LocalArchiveManager(context) }
+            val localLibraryGroupManager = remember { LibraryGroupManager(context) }
             val localSearchEngine = remember { LocalSearchEngine(context) }
 
             var selectedTab by remember { mutableIntStateOf(0) }
 
-            MangaPanelSearchTheme(preset = currentPreset) {
+            MangaPanelSearchTheme(
+                preset = currentPreset,
+                themeMode = currentThemeMode,
+                useDynamicColor = useDynamicColor
+            ) {
                 Scaffold(
                     modifier = Modifier.fillMaxSize(),
                     topBar = {
@@ -59,7 +71,8 @@ class MainActivity : ComponentActivity() {
                                 Text(
                                     text = "MANGA PANEL SEARCH",
                                     fontWeight = FontWeight.Black,
-                                    fontSize = 18.sp
+                                    fontSize = 17.sp,
+                                    letterSpacing = 0.5.sp
                                 )
                             },
                             navigationIcon = {
@@ -122,13 +135,16 @@ class MainActivity : ComponentActivity() {
                         0 -> SearchScreen(
                             isLocalMode = isLocalMode,
                             localArchiveManager = localArchiveManager,
+                            localLibraryGroupManager = localLibraryGroupManager,
                             localSearchEngine = localSearchEngine,
                             apiClient = apiClient,
+                            onNavigateToLibrary = { selectedTab = 1 },
                             modifier = Modifier.padding(innerPadding)
                         )
                         1 -> LibraryScreen(
                             isLocalMode = isLocalMode,
                             localArchiveManager = localArchiveManager,
+                            localLibraryGroupManager = localLibraryGroupManager,
                             localSearchEngine = localSearchEngine,
                             apiClient = apiClient,
                             modifier = Modifier.padding(innerPadding)
@@ -145,6 +161,16 @@ class MainActivity : ComponentActivity() {
                             onPresetSelected = { newPreset ->
                                 currentPreset = newPreset
                                 prefs.edit().putString("theme_preset", newPreset.id).apply()
+                            },
+                            themeMode = currentThemeMode,
+                            onThemeModeChanged = { newMode ->
+                                currentThemeMode = newMode
+                                prefs.edit().putString("theme_mode", newMode.id).apply()
+                            },
+                            useDynamicColor = useDynamicColor,
+                            onDynamicColorChanged = { enabled ->
+                                useDynamicColor = enabled
+                                prefs.edit().putBoolean("use_dynamic_color", enabled).apply()
                             },
                             modifier = Modifier.padding(innerPadding)
                         )

@@ -13,37 +13,39 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.AutoFixHigh
-import androidx.compose.material.icons.filled.CheckCircle
-import androidx.compose.material.icons.filled.CloudUpload
-import androidx.compose.material.icons.filled.ContentPaste
-import androidx.compose.material.icons.filled.ImageSearch
-import androidx.compose.material.icons.filled.PhotoLibrary
+import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.core.content.FileProvider
 import com.mangapanel.search.data.api.MangaApiClient
 import com.mangapanel.search.data.engine.LocalSearchEngine
+import com.mangapanel.search.data.local.LibraryGroupManager
 import com.mangapanel.search.data.local.LocalArchiveManager
 import com.mangapanel.search.data.model.SearchResultItem
 import com.mangapanel.search.ui.components.PanelHighlightViewer
 import kotlinx.coroutines.launch
+import java.io.File
 
 @Composable
 fun SearchScreen(
     isLocalMode: Boolean,
     localArchiveManager: LocalArchiveManager,
+    localLibraryGroupManager: LibraryGroupManager,
     localSearchEngine: LocalSearchEngine,
     apiClient: MangaApiClient,
+    onNavigateToLibrary: () -> Unit,
     modifier: Modifier = Modifier
 ) {
     val context = LocalContext.current
@@ -54,24 +56,68 @@ fun SearchScreen(
     var normalizePhoto by remember { mutableStateOf(true) }
     var minScore by remember { mutableFloatStateOf(0.20f) }
     var candidatePoolStep by remember { mutableFloatStateOf(0f) } // 0:全探索, 1:網羅(150), 2:標準(80), 3:超高速(40)
-    var minPanelAreaPercent by remember { mutableFloatStateOf(2.0f) }
+    var minPanelAreaPercent by remember { mutableFloatStateOf(1.0f) }
 
     var isSearching by remember { mutableStateOf(false) }
     var searchResults by remember { mutableStateOf<List<SearchResultItem>>(emptyList()) }
     var errorMessage by remember { mutableStateOf<String?>(null) }
 
-    // Image Picker Launcher
+    // Camera Capture temp file & launcher
+    var tempCameraUri by remember { mutableStateOf<Uri?>(null) }
+    val cameraLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.TakePicture()
+    ) { success ->
+        if (success && tempCameraUri != null) {
+            try {
+                context.contentResolver.openInputStream(tempCameraUri!!)?.use { stream ->
+                    selectedImageBytes = stream.readBytes()
+                    selectedImageUri = tempCameraUri
+                    searchResults = emptyList()
+                    errorMessage = null
+                }
+            } catch (e: Exception) {
+                errorMessage = "カメラ写真の取得に失敗しました: ${e.localizedMessage}"
+            }
+        }
+    }
+
+    fun launchCamera() {
+        try {
+            val cacheFile = File(context.cacheDir, "camera_query_${System.currentTimeMillis()}.jpg")
+            val uri = FileProvider.getUriForFile(
+                context,
+                "${context.packageName}.fileprovider",
+                cacheFile
+            )
+            tempCameraUri = uri
+            cameraLauncher.launch(uri)
+        } catch (e: Exception) {
+            errorMessage = "カメラの起動に失敗しました: ${e.localizedMessage}"
+        }
+    }
+
+    // Gallery Picker Launcher
     val imagePicker = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.GetContent()
     ) { uri: Uri? ->
         uri?.let {
             selectedImageUri = it
-            context.contentResolver.openInputStream(it)?.use { stream ->
-                selectedImageBytes = stream.readBytes()
+            try {
+                context.contentResolver.openInputStream(it)?.use { stream ->
+                    selectedImageBytes = stream.readBytes()
+                }
+                searchResults = emptyList()
+                errorMessage = null
+            } catch (e: Exception) {
+                errorMessage = "画像の読み込みに失敗しました: ${e.localizedMessage}"
             }
-            searchResults = emptyList()
-            errorMessage = null
         }
+    }
+
+    // Calculate Search Scope stats
+    val allLocalArchives = remember { localArchiveManager.getArchives() }
+    val enabledArchiveNames = remember(allLocalArchives) {
+        localLibraryGroupManager.getEnabledArchiveNames(allLocalArchives.map { it.name })
     }
 
     LazyColumn(
@@ -80,7 +126,79 @@ fun SearchScreen(
             .padding(16.dp),
         verticalArrangement = Arrangement.spacedBy(16.dp)
     ) {
-        // 1. Upload Card
+        // 1. Search Scope Banner
+        item {
+            Card(
+                shape = RoundedCornerShape(16.dp),
+                colors = CardDefaults.cardColors(
+                    containerColor = MaterialTheme.colorScheme.primaryContainer
+                ),
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 16.dp, vertical = 12.dp),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(12.dp),
+                        modifier = Modifier.weight(1f)
+                    ) {
+                        Icon(
+                            Icons.Default.FilterAlt,
+                            contentDescription = null,
+                            tint = MaterialTheme.colorScheme.onPrimaryContainer,
+                            modifier = Modifier.size(24.dp)
+                        )
+                        Column {
+                            val scopeTitle = if (isLocalMode) {
+                                if (allLocalArchives.isEmpty()) {
+                                    "検索対象: ライブラリ未登録"
+                                } else if (enabledArchiveNames.size == allLocalArchives.size) {
+                                    "検索対象: 全巻 (${enabledArchiveNames.size}巻)"
+                                } else {
+                                    "検索対象: 選択された ${enabledArchiveNames.size}/${allLocalArchives.size} 巻"
+                                }
+                            } else {
+                                "検索対象: PCサーバー内ライブラリ"
+                            }
+                            Text(
+                                text = scopeTitle,
+                                fontWeight = FontWeight.Bold,
+                                fontSize = 14.sp,
+                                color = MaterialTheme.colorScheme.onPrimaryContainer
+                            )
+                            Text(
+                                text = if (isLocalMode) "チェックされた作品のみを対象に照合します" else "PC側の全設定対象から検索します",
+                                fontSize = 11.sp,
+                                color = MaterialTheme.colorScheme.onPrimaryContainer.copy(alpha = 0.8f)
+                            )
+                        }
+                    }
+
+                    if (isLocalMode) {
+                        OutlinedButton(
+                            onClick = onNavigateToLibrary,
+                            shape = RoundedCornerShape(9999.dp),
+                            colors = ButtonDefaults.outlinedButtonColors(
+                                contentColor = MaterialTheme.colorScheme.onPrimaryContainer
+                            ),
+                            border = androidx.compose.foundation.BorderStroke(1.dp, MaterialTheme.colorScheme.onPrimaryContainer.copy(alpha = 0.5f)),
+                            contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp)
+                        ) {
+                            Icon(Icons.Default.LibraryBooks, contentDescription = null, modifier = Modifier.size(16.dp))
+                            Spacer(Modifier.width(4.dp))
+                            Text("対象変更", fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                        }
+                    }
+                }
+            }
+        }
+
+        // 2. Upload Card
         item {
             Card(
                 shape = RoundedCornerShape(20.dp),
@@ -106,19 +224,26 @@ fun SearchScreen(
                             ),
                             color = MaterialTheme.colorScheme.onSurface
                         )
-                        AssistChip(
-                            onClick = {},
-                            label = {
-                                Text(
-                                    text = if (isLocalMode) "📱 端末単体" else "💻 PC連携",
-                                    fontSize = 11.sp,
-                                    fontWeight = FontWeight.Bold
+                        if (selectedImageBytes != null) {
+                            IconButton(
+                                onClick = {
+                                    selectedImageBytes = null
+                                    selectedImageUri = null
+                                    searchResults = emptyList()
+                                    errorMessage = null
+                                },
+                                modifier = Modifier.size(32.dp)
+                            ) {
+                                Icon(
+                                    Icons.Default.Close,
+                                    contentDescription = "画像をクリア",
+                                    tint = MaterialTheme.colorScheme.outline
                                 )
                             }
-                        )
+                        }
                     }
 
-                    // Image Picker Dropzone Box
+                    // Dropzone / Selected Image Preview Box
                     Box(
                         modifier = Modifier
                             .fillMaxWidth()
@@ -126,7 +251,7 @@ fun SearchScreen(
                             .clip(RoundedCornerShape(16.dp))
                             .background(MaterialTheme.colorScheme.surfaceContainerLowest)
                             .border(
-                                width = 2.dp,
+                                width = 1.5.dp,
                                 color = MaterialTheme.colorScheme.outlineVariant,
                                 shape = RoundedCornerShape(16.dp)
                             )
@@ -143,6 +268,21 @@ fun SearchScreen(
                                     contentDescription = "Selected Query Panel",
                                     modifier = Modifier.fillMaxSize()
                                 )
+                                Box(
+                                    modifier = Modifier
+                                        .align(Alignment.BottomEnd)
+                                        .padding(8.dp)
+                                        .clip(RoundedCornerShape(9999.dp))
+                                        .background(Color.Black.copy(alpha = 0.70f))
+                                        .padding(horizontal = 8.dp, vertical = 4.dp)
+                                ) {
+                                    Text(
+                                        text = "${bitmap.width} × ${bitmap.height}",
+                                        color = Color.White,
+                                        fontSize = 11.sp,
+                                        fontWeight = FontWeight.Bold
+                                    )
+                                }
                             }
                         } else {
                             Column(
@@ -153,35 +293,47 @@ fun SearchScreen(
                                     imageVector = Icons.Default.CloudUpload,
                                     contentDescription = null,
                                     tint = MaterialTheme.colorScheme.primary,
-                                    modifier = Modifier.size(44.dp)
+                                    modifier = Modifier.size(42.dp)
                                 )
                                 Text(
                                     text = "タップしてコマ画像を選択",
                                     fontWeight = FontWeight.Bold,
-                                    color = MaterialTheme.colorScheme.onSurface
+                                    color = MaterialTheme.colorScheme.onSurface,
+                                    fontSize = 14.sp
                                 )
                                 Text(
-                                    text = "端末の写真アルバムから選択できます",
+                                    text = "写真アルバム・カメラ撮影・クリップボード貼付対応",
                                     style = MaterialTheme.typography.bodySmall,
-                                    color = MaterialTheme.colorScheme.outline
+                                    color = MaterialTheme.colorScheme.outline,
+                                    fontSize = 11.sp
                                 )
                             }
                         }
                     }
 
-                    // Action Buttons: Select Image & Paste from Clipboard
+                    // Input Action Buttons (Photo Gallery, Camera, Clipboard)
                     Row(
                         modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.spacedBy(10.dp)
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
                     ) {
                         OutlinedButton(
                             onClick = { imagePicker.launch("image/*") },
                             modifier = Modifier.weight(1f),
                             shape = RoundedCornerShape(9999.dp)
                         ) {
-                            Icon(Icons.Default.PhotoLibrary, contentDescription = null, modifier = Modifier.size(18.dp))
-                            Spacer(Modifier.width(6.dp))
-                            Text("画像を選択", fontWeight = FontWeight.Bold, fontSize = 13.sp)
+                            Icon(Icons.Default.PhotoLibrary, contentDescription = null, modifier = Modifier.size(16.dp))
+                            Spacer(Modifier.width(4.dp))
+                            Text("アルバム", fontWeight = FontWeight.Bold, fontSize = 11.sp)
+                        }
+
+                        FilledTonalButton(
+                            onClick = { launchCamera() },
+                            modifier = Modifier.weight(1f),
+                            shape = RoundedCornerShape(9999.dp)
+                        ) {
+                            Icon(Icons.Default.PhotoCamera, contentDescription = null, modifier = Modifier.size(16.dp))
+                            Spacer(Modifier.width(4.dp))
+                            Text("カメラ", fontWeight = FontWeight.Bold, fontSize = 11.sp)
                         }
 
                         Button(
@@ -206,19 +358,19 @@ fun SearchScreen(
                                     }
                                 }
                                 if (!imageLoaded) {
-                                    errorMessage = "クリップボードに画像が見つかりませんでした。画像をコピーしてから再度お試しください。"
+                                    errorMessage = "クリップボードに画像が見つかりませんでした。"
                                 }
                             },
                             modifier = Modifier.weight(1f),
                             shape = RoundedCornerShape(9999.dp)
                         ) {
-                            Icon(Icons.Default.ContentPaste, contentDescription = null, modifier = Modifier.size(18.dp))
-                            Spacer(Modifier.width(6.dp))
-                            Text("クリップボード貼付", fontWeight = FontWeight.Bold, fontSize = 13.sp)
+                            Icon(Icons.Default.ContentPaste, contentDescription = null, modifier = Modifier.size(16.dp))
+                            Spacer(Modifier.width(4.dp))
+                            Text("貼付", fontWeight = FontWeight.Bold, fontSize = 11.sp)
                         }
                     }
 
-                    // Photo Normalization Toggle
+                    // Photo Illumination / Yellow Paper Normalization Toggle
                     Card(
                         shape = RoundedCornerShape(12.dp),
                         colors = CardDefaults.cardColors(
@@ -245,13 +397,13 @@ fun SearchScreen(
                                 )
                                 Column {
                                     Text(
-                                        text = "紙焼け・黄ばみ・影の自動補正",
+                                        text = "紙焼け・黄ばみ・撮影影の自動補正",
                                         fontWeight = FontWeight.Bold,
                                         fontSize = 13.sp,
                                         color = MaterialTheme.colorScheme.onSurface
                                     )
                                     Text(
-                                        text = "撮影写真の背景を自動で白く平坦化（OFFで従来方式）",
+                                        text = "撮影写真の背景を自動で白く平坦化（OFFで原画のまま照合）",
                                         style = MaterialTheme.typography.bodySmall,
                                         fontSize = 11.sp,
                                         color = MaterialTheme.colorScheme.secondary
@@ -287,7 +439,7 @@ fun SearchScreen(
                             horizontalArrangement = Arrangement.SpaceBetween
                         ) {
                             Text(
-                                text = "⚡ 粗検索モード (探索速度 vs 網羅性)",
+                                text = "⚡ 高速照合モード (粗探索サンプリング)",
                                 style = MaterialTheme.typography.bodyMedium,
                                 fontWeight = FontWeight.Bold,
                                 color = MaterialTheme.colorScheme.onSurface
@@ -311,7 +463,7 @@ fun SearchScreen(
                     // Slider 2: Min Panel Area Tolerance
                     val minPanelAreaLabel = when {
                         minPanelAreaPercent <= 0.8f -> "0.5% (極小コマも検出)"
-                        minPanelAreaPercent <= 3.0f -> String.format("%.1f%% (標準)", minPanelAreaPercent)
+                        minPanelAreaPercent <= 2.0f -> String.format("%.1f%% (標準・推奨)", minPanelAreaPercent)
                         else -> String.format("%.1f%% (大コマ重視/ゴミ排除)", minPanelAreaPercent)
                     }
 
@@ -321,7 +473,7 @@ fun SearchScreen(
                             horizontalArrangement = Arrangement.SpaceBetween
                         ) {
                             Text(
-                                text = "📐 コマの小ささ許容度",
+                                text = "📐 コマの小ささ許容度 (最小コマ面積比率)",
                                 style = MaterialTheme.typography.bodyMedium,
                                 fontWeight = FontWeight.Bold,
                                 color = MaterialTheme.colorScheme.onSurface
@@ -341,7 +493,7 @@ fun SearchScreen(
                         )
                     }
 
-                    // Min Score Slider
+                    // Slider 3: Min Score Slider
                     Column {
                         Row(
                             modifier = Modifier.fillMaxWidth(),
@@ -384,16 +536,24 @@ fun SearchScreen(
                                             errorMessage = "画像のデコードに失敗しました"
                                             return@launch
                                         }
-                                        val archives = localArchiveManager.getArchives()
-                                        if (archives.isEmpty()) {
+                                        val allArcs = localArchiveManager.getArchives()
+                                        if (allArcs.isEmpty()) {
                                             isSearching = false
                                             errorMessage = "登録された漫画がありません。「設定」からフォルダを選択してください。"
                                             return@launch
                                         }
 
+                                        val activeEnabledNames = localLibraryGroupManager.getEnabledArchiveNames(allArcs.map { it.name })
+                                        val targetArchives = allArcs.filter { it.name in activeEnabledNames }
+                                        if (targetArchives.isEmpty()) {
+                                            isSearching = false
+                                            errorMessage = "検索対象として選択されている漫画がありません。「ライブラリ」画面で作品にチェックを入れてください。"
+                                            return@launch
+                                        }
+
                                         val results = localSearchEngine.searchPanel(
                                             queryBitmap = bmp,
-                                            archives = archives,
+                                            archives = targetArchives,
                                             minScore = minScore,
                                             normalizePhoto = normalizePhoto,
                                             candidatePoolSize = candidatePoolSize,
@@ -433,7 +593,8 @@ fun SearchScreen(
                         Spacer(Modifier.width(8.dp))
                         Text(
                             text = if (isLocalMode) "端末内で特定する" else "PCサーバーで特定する",
-                            fontWeight = FontWeight.Bold
+                            fontWeight = FontWeight.Bold,
+                            fontSize = 15.sp
                         )
                     }
 
@@ -444,13 +605,14 @@ fun SearchScreen(
             }
         }
 
-        // Error message
+        // Error message card
         if (errorMessage != null) {
             item {
                 Card(
                     colors = CardDefaults.cardColors(
                         containerColor = MaterialTheme.colorScheme.errorContainer
                     ),
+                    shape = RoundedCornerShape(16.dp),
                     modifier = Modifier.fillMaxWidth()
                 ) {
                     Text(
@@ -463,7 +625,7 @@ fun SearchScreen(
             }
         }
 
-        // 2. Results Header
+        // 3. Results Header Toolbar
         if (searchResults.isNotEmpty()) {
             item {
                 Row(
@@ -473,21 +635,35 @@ fun SearchScreen(
                     horizontalArrangement = Arrangement.SpaceBetween,
                     verticalAlignment = Alignment.CenterVertically
                 ) {
-                    Text(
-                        text = "特定結果",
-                        style = MaterialTheme.typography.titleMedium.copy(
-                            fontWeight = FontWeight.Bold
-                        ),
-                        color = MaterialTheme.colorScheme.onSurface
-                    )
-                    Badge {
-                        Text("${searchResults.size} 件検出", modifier = Modifier.padding(horizontal = 4.dp))
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        Text(
+                            text = "特定結果",
+                            style = MaterialTheme.typography.titleMedium.copy(
+                                fontWeight = FontWeight.Bold
+                            ),
+                            color = MaterialTheme.colorScheme.onSurface
+                        )
+                        Badge {
+                            Text("${searchResults.size} 件検出", modifier = Modifier.padding(horizontal = 4.dp))
+                        }
+                    }
+
+                    TextButton(
+                        onClick = { searchResults = emptyList() },
+                        shape = RoundedCornerShape(9999.dp)
+                    ) {
+                        Icon(Icons.Default.ClearAll, contentDescription = null, modifier = Modifier.size(16.dp))
+                        Spacer(Modifier.width(4.dp))
+                        Text("結果をクリア", fontSize = 12.sp)
                     }
                 }
             }
         }
 
-        // 3. Results List
+        // 4. Results List Cards
         items(searchResults) { res ->
             Card(
                 shape = RoundedCornerShape(16.dp),
@@ -506,7 +682,7 @@ fun SearchScreen(
                         horizontalArrangement = Arrangement.SpaceBetween,
                         verticalAlignment = Alignment.CenterVertically
                     ) {
-                        Column {
+                        Column(modifier = Modifier.weight(1f)) {
                             Text(
                                 text = res.archiveName,
                                 fontWeight = FontWeight.Bold,
@@ -517,7 +693,12 @@ fun SearchScreen(
                                 text = "PAGE ${res.pageNumber} (${res.pageFilename})",
                                 fontWeight = FontWeight.Bold,
                                 color = MaterialTheme.colorScheme.primary,
-                                fontSize = 14.sp
+                                fontSize = 13.sp
+                            )
+                            Text(
+                                text = "インライア一致点: ${res.inliersCount} 点",
+                                fontSize = 11.sp,
+                                color = MaterialTheme.colorScheme.secondary
                             )
                         }
 
@@ -533,13 +714,14 @@ fun SearchScreen(
                                 Icon(
                                     Icons.Default.CheckCircle,
                                     contentDescription = null,
-                                    modifier = Modifier.size(16.dp)
+                                    modifier = Modifier.size(16.dp),
+                                    tint = MaterialTheme.colorScheme.primary
                                 )
                             }
                         )
                     }
 
-                    // Page Viewer with Animated Highlight Box
+                    // Page Viewer with Animated Highlight Box & Pinch Zoom
                     val imageModel: Any = if (isLocalMode) {
                         remember(res.archiveName, res.pageIndex) {
                             localArchiveManager.getPageBitmap(res.archiveName, res.pageIndex) ?: ""
@@ -551,6 +733,8 @@ fun SearchScreen(
                     PanelHighlightViewer(
                         imageUrl = imageModel,
                         boundingBox = res.boundingBox,
+                        title = res.archiveName,
+                        subtitle = "PAGE ${res.pageNumber} (${(res.score * 100).toInt()}% 一致)",
                         modifier = Modifier.fillMaxWidth()
                     )
                 }
